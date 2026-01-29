@@ -5,7 +5,7 @@ from supabase import Client
 
 router = APIRouter(prefix="/storage", tags=["Storage"])
 
-BUCKET_NAME = GCS_BUCKET_NAME or "ai-driving-lessons"
+BUCKET_NAME = GCS_BUCKET_NAME or "ai-images"
 
 @router.post("/upload")
 async def upload_file(
