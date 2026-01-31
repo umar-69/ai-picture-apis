@@ -42,9 +42,14 @@ async def generate_image(
         # 2. Fetch Dataset context if provided
         dataset_context = ""
         if request.dataset_id:
-             dataset_res = supabase.table("datasets").select("*").eq("id", request.dataset_id).single().execute()
-             if dataset_res.data:
-                 dataset_context = f"Style Guidelines: {dataset_res.data.get('master_prompt')}"
+            try:
+                 dataset_res = supabase.table("datasets").select("*").eq("id", request.dataset_id).single().execute()
+                 if dataset_res.data:
+                     dataset_context = f"Style Guidelines: {dataset_res.data.get('master_prompt')}"
+            except Exception:
+                # Ignore if dataset not found (PGRST116) or other error.
+                # This allows anonymous users with local-only dataset IDs to still generate images.
+                pass
 
         full_prompt = f"{business_context} {dataset_context} {request.prompt}"
         
