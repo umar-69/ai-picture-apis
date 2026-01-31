@@ -89,17 +89,17 @@ async def analyze_dataset_images(
         ds_check = supabase.table("datasets").select("id").eq("id", actual_dataset_id).execute()
         if not ds_check.data:
             # Create it if missing
-            # Use current_user.id if available, else a random UUID (assuming no strict FK on user_id to auth.users or using service role)
-            owner_id = current_user.id if current_user else str(uuid.uuid4())
+            # user_id is now nullable to support anonymous uploads
             new_dataset = {
                 "id": actual_dataset_id,
-                "user_id": owner_id,
+                "user_id": current_user.id if current_user else None,
                 "name": "Untitled Dataset"
             }
             supabase.table("datasets").insert(new_dataset).execute()
-            print(f"Created missing dataset: {actual_dataset_id}")
+            print(f"Created missing dataset: {actual_dataset_id} for {'user ' + current_user.id if current_user else 'anonymous user'}")
     except Exception as e:
         print(f"Warning: Could not check/create dataset: {e}")
+        # Continue anyway - if dataset creation fails, the image insert will fail with FK error
 
     if not files:
          raise HTTPException(status_code=400, detail="No files provided. Please upload at least one image.")

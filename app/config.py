@@ -5,23 +5,27 @@ from dotenv import load_dotenv
 load_dotenv()
 
 # Supabase configuration
-SUPABASE_URL = os.getenv("SUPABASE_URL")
-SUPABASE_URL_DEV = os.getenv("SUPABASE_URL_DEV")
+# IMPORTANT: Using PRODUCTION environment to match frontend/mobile apps
+SUPABASE_URL = os.getenv("SUPABASE_URL")  # PROD: https://qxripdllxckfpnimzxoa.supabase.co
+SUPABASE_URL_DEV = os.getenv("SUPABASE_URL_DEV")  # DEV: https://fxrygwdyysakwsfcjjts.supabase.co
 
 # Anon key for client operations (JWT format - this is what Supabase client expects)
-SUPABASE_ANON_KEY = os.getenv("SUPABASE_ANON_KEY")
-SUPABSE_DEV_KEY = os.getenv("SUPABSE_DEV_KEY")
-# Service key for backend operations (Note: This format is not a JWT and won't work with Supabase Python client)
-# The sbp_ format is for server-side SDKs, not the Python client which expects JWT tokens
-SUPABASE_SERVICE_KEY = os.getenv("SUPABASE_SERVICE_KEY")
-# This is the actual JWT service role key found in the snippet
-SUPABASE_SERVICE_ROLE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY")
+SUPABASE_ANON_KEY = os.getenv("SUPABASE_ANON_KEY")  # PROD anon key
+SUPABASE_ANON_KEY_DEV = os.getenv("SUPABSE_DEV_KEY")  # DEV anon key
 
-# IMPORTANT: The Supabase Python client requires a JWT token, not the sbp_ format service key
-# Using anon key for all operations as it's in the correct JWT format
-# With RLS disabled on your tables, the anon key will work for all CRUD operations
-SUPABASE_KEY = SUPABASE_ANON_KEY  # Always use anon key which is in JWT format
-SUPABASE_DEV_KEY = SUPABSE_DEV_KEY
+# Service key for backend operations
+# The sbp_ format is for server-side SDKs, not the Python client which expects JWT tokens
+SUPABASE_SERVICE_KEY = os.getenv("SUPABASE_SERVICE_KEY")  # sbp_ format (not used)
+
+# Service Role Key (JWT format) - for DEV environment only
+# NOTE: We don't have a PROD service role key in .env, so we'll use anon key for PROD
+SUPABASE_SERVICE_ROLE_KEY_DEV = os.getenv("SUPABASE_SERVICE_ROLE_KEY")  # DEV service role
+
+# IMPORTANT: The Supabase Python client requires a JWT token
+# For PROD: Using anon key (RLS is disabled on tables, so anon key has full access)
+# For DEV: Could use service role key, but we're on PROD
+SUPABASE_KEY = SUPABASE_ANON_KEY  # Use PROD anon key
+SUPABASE_SERVICE_ROLE_KEY = SUPABASE_ANON_KEY  # Use anon key as "service role" for PROD
 
 # Database settings
 DB_POOL_SIZE = 5
