@@ -4,7 +4,7 @@ from typing import List
 import uuid
 import json
 from app.schemas import GenerateImageRequest, AnalyzeImageRequest
-from app.dependencies import get_current_user, get_current_user_optional, get_supabase
+from app.dependencies import get_current_user, get_current_user_optional, get_supabase, get_supabase_admin
 from app.config import GOOGLE_API_KEY
 from supabase import Client
 import os
@@ -71,11 +71,12 @@ async def analyze_dataset_images(
     datasetId: str = Form(None), # Alias for frontend convenience
     files: List[UploadFile] = File(None),
     current_user = Depends(get_current_user_optional),
-    supabase: Client = Depends(get_supabase)
+    supabase: Client = Depends(get_supabase_admin)
 ):
     """
     Uploads images to Supabase Storage, analyzes them, and saves results to DB.
     Allows anonymous users for free tries (frontend managed limit).
+    Uses Service Role (admin) to bypass RLS for uploads/inserts.
     """
     # Handle optional/aliased inputs
     actual_dataset_id = dataset_id or datasetId
