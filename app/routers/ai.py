@@ -2,6 +2,7 @@ import google.generativeai as genai
 from fastapi import APIRouter, Depends, HTTPException, status, UploadFile, File, Form
 from typing import List
 import uuid
+import json
 from app.schemas import GenerateImageRequest, AnalyzeImageRequest
 from app.dependencies import get_current_user, get_current_user_optional, get_supabase
 from app.config import GOOGLE_API_KEY
@@ -90,32 +91,56 @@ async def analyze_dataset_images(
             public_url = supabase.storage.from_("dataset-images").get_public_url(file_path)
             
             # 2. Analyze with Gemini
-            # We can pass the image data directly to Gemini if we want, or use the URL if supported.
-            # Since we have the bytes (file_content), we can use that.
+            # We use the file content we already have in memory for efficiency.
             
             analysis_result = {}
             if GOOGLE_API_KEY:
                 try:
-                    model = genai.GenerativeModel('gemini-pro-vision')
+                    # Use gemini-3-flash for state-of-the-art vision analysis
+                    model = genai.GenerativeModel('gemini-3-flash')
                     
-                    # Create a Part object for the image
-                    # Gemini expects specific format. 
-                    # For simplicity in this example, we'll assume we can pass the bytes or a Part.
-                    # Using a placeholder prompt for now as requested.
-                    
-                    # NOTE: In a real implementation, you'd construct the proper content parts:
-                    # image_part = {"mime_type": file.content_type, "data": file_content}
-                    # response = model.generate_content(["Analyze this image style", image_part])
-                    # analysis_result = {"text": response.text}
-                    
-                    # Mocking the AI response for stability in this task unless I'm sure about the input format
-                    analysis_result = {
-                        "description": "AI Analysis of the image style",
-                        "tags": ["professional", "clean", "modern"]
+                    # Prepare the image part
+                    image_part = {
+                        "mime_type": file.content_type or "image/jpeg",
+                        "data": file_content
                     }
+                    
+                    prompt = """
+                    Analyze this image and provide a JSON output with the following keys:
+                    - "description": A detailed description of the image content and style.
+                    - "tags": A list of 5-10 keywords describing the style, subject, and vibe.
+                    - "lighting": Description of the lighting (e.g., natural, studio, dark, bright).
+                    - "colors": Dominant colors or color palette.
+                    - "vibe": The overall mood or atmosphere.
+                    
+                    Ensure the output is valid JSON. Do not include markdown formatting like ```json.
+                    """
+                    
+                    response = model.generate_content([prompt, image_part])
+                    
+                    # Parse the response
+                    response_text = response.text.strip()
+                    # Clean up markdown code blocks if present
+                    if response_text.startswith("```json"):
+                        response_text = response_text[7:]
+                    if response_text.startswith("```"):
+                        response_text = response_text[3:]
+                    if response_text.endswith("```"):
+                        response_text = response_text[:-3]
+                        
+                    try:
+                        analysis_result = json.loads(response_text)
+                    except json.JSONDecodeError:
+                        # Fallback if JSON parsing fails
+                        analysis_result = {
+                            "description": response_text,
+                            "tags": [],
+                            "error": "Failed to parse structured analysis"
+                        }
+                        
                 except Exception as ai_error:
                     print(f"AI Analysis failed: {ai_error}")
-                    analysis_result = {"error": "AI analysis failed"}
+                    analysis_result = {"error": f"AI analysis failed: {str(ai_error)}"}
             
             # 3. Store in DB
             data = {
