@@ -57,8 +57,9 @@ async def generate_image(
 
 @router.post("/dataset/analyze")
 async def analyze_dataset_images(
-    dataset_id: str = Form(...),
-    files: List[UploadFile] = File(...),
+    dataset_id: str = Form(None),
+    datasetId: str = Form(None), # Alias for frontend convenience
+    files: List[UploadFile] = File(None),
     current_user = Depends(get_current_user_optional),
     supabase: Client = Depends(get_supabase)
 ):
@@ -66,6 +67,14 @@ async def analyze_dataset_images(
     Uploads images to Supabase Storage, analyzes them, and saves results to DB.
     Allows anonymous users for free tries (frontend managed limit).
     """
+    # Handle optional/aliased inputs
+    actual_dataset_id = dataset_id or datasetId
+    if not actual_dataset_id:
+        raise HTTPException(status_code=400, detail="dataset_id is required")
+    
+    if not files:
+         raise HTTPException(status_code=400, detail="No files provided. Please upload at least one image.")
+
     # If current_user is None, it's an anonymous request.
     # We allow it for free tries.
     
@@ -76,7 +85,7 @@ async def analyze_dataset_images(
             # 1. Upload to Supabase Storage
             file_content = await file.read()
             file_ext = file.filename.split(".")[-1] if "." in file.filename else "jpg"
-            file_path = f"{dataset_id}/{uuid.uuid4()}.{file_ext}"
+            file_path = f"{actual_dataset_id}/{uuid.uuid4()}.{file_ext}"
             
             # Upload file
             # Note: Supabase Python client might raise error if upload fails
@@ -144,7 +153,7 @@ async def analyze_dataset_images(
             
             # 3. Store in DB
             data = {
-                "dataset_id": dataset_id,
+                "dataset_id": actual_dataset_id,
                 "image_url": public_url,
                 "analysis_result": analysis_result
             }

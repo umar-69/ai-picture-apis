@@ -6,7 +6,7 @@ This guide details the changes required in the frontend application to integrate
 
 The backend has been updated to support direct file uploads. Instead of converting images to Base64 strings, you should now send `File` objects directly using `FormData`. The backend handles uploading these files to Supabase Storage and storing the analysis results in the database.
 
-## New API Endpoint
+## 1. Upload & Analyze Images
 
 **URL**: `/ai/dataset/analyze`
 **Method**: `POST`
@@ -81,16 +81,66 @@ The API returns a JSON object containing the results of the operation.
 }
 ```
 
+## 2. Fetch Dataset Images & Analysis
+
+**URL**: `/ai/dataset/{dataset_id}/images`
+**Method**: `GET`
+**Auth**: Optional (Supports anonymous users for free tries)
+
+Use this endpoint to retrieve all images uploaded to a dataset along with their AI-generated analysis (tags, description, style).
+
+### Example Request
+
+```typescript
+async function getDatasetImages(datasetId: string) {
+  try {
+    const response = await fetch(`https://ai-picture-apis.onrender.com/ai/dataset/${datasetId}/images`, {
+      method: 'GET',
+      headers: {
+        // Optional: Include token if user is logged in
+        // 'Authorization': `Bearer ${session.access_token}`
+      }
+    });
+
+    if (!response.ok) {
+      throw new Error(`Error: ${response.statusText}`);
+    }
+
+    const data = await response.json();
+    return data.images;
+  } catch (error) {
+    console.error('Fetch failed:', error);
+    throw error;
+  }
+}
+```
+
+### Response Format
+
+```json
+{
+  "images": [
+    {
+      "id": "uuid-of-record",
+      "dataset_id": "uuid-of-dataset",
+      "image_url": "https://supabasestorage.com/.../image.jpg",
+      "analysis_result": {
+        "description": "A detailed description of the image content and style.",
+        "tags": ["modern", "minimalist", "warm lighting"],
+        "lighting": "Natural sunlight",
+        "colors": ["#FFFFFF", "#FF5733"],
+        "vibe": "Professional and clean"
+      },
+      "created_at": "2024-01-30T12:00:00Z"
+    }
+  ]
+}
+```
+
 ## Migration Steps for `src/routes/image/+page.svelte`
 
 1.  **Remove Base64 Conversion**: Delete the code that uses `FileReader` to convert images to data URLs (`data:image/jpeg;base64...`).
 2.  **Store File Objects**: Update your state to store the original `File` objects returned from the file input.
 3.  **Update API Call**: Replace the call to `analyzeImagesWithGemini` with the new `uploadAndAnalyzeImages` function (or equivalent logic) shown above.
 4.  **Handle Response**: The response now contains the permanent URL (`image_url`) and the analysis. Update your UI to display these.
-
-## Database Changes (Backend)
-
-The backend now writes to a new table `dataset_images` in Supabase:
-- `dataset_id`: Links to your dataset.
-- `image_url`: Public URL of the uploaded image.
-- `analysis_result`: JSON field containing AI analysis.
+5.  **Display Analysis**: Use the `analysis_result` object to show tags, descriptions, and other style info on the frontend.
