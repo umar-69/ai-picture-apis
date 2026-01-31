@@ -161,6 +161,26 @@ async def analyze_dataset_images(
 
     return {"results": results}
 
+@router.get("/dataset/{dataset_id}/images")
+async def get_dataset_images(
+    dataset_id: str,
+    current_user = Depends(get_current_user_optional),
+    supabase: Client = Depends(get_supabase)
+):
+    """
+    Fetch all images and their analysis results for a specific dataset.
+    """
+    try:
+        # Fetch images from the database
+        res = supabase.table("dataset_images").select("*").eq("dataset_id", dataset_id).execute()
+        
+        if not res.data:
+            return {"images": []}
+            
+        return {"images": res.data}
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
 @router.post("/analyze")
 async def analyze_style(
     request: AnalyzeImageRequest,
