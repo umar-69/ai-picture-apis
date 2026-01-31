@@ -18,7 +18,7 @@ router = APIRouter(prefix="/ai", tags=["AI"])
 @router.post("/generate")
 async def generate_image(
     request: GenerateImageRequest,
-    current_user = Depends(get_current_user),
+    current_user = Depends(get_current_user_optional),
     supabase: Client = Depends(get_supabase)
 ):
     # This is a placeholder for actual Gemini Image Generation
@@ -27,12 +27,17 @@ async def generate_image(
     # Assuming "gemini-3-pro-image-preview" is the model user mentioned.
     
     try:
-        # 1. Fetch Business Profile context if needed
-        profile_res = supabase.table("business_profiles").select("*").eq("id", current_user.id).single().execute()
+        # 1. Fetch Business Profile context if needed (only if user is logged in)
         business_context = ""
-        if profile_res.data:
-            p = profile_res.data
-            business_context = f"Brand: {p.get('business_name')}. Vibe: {p.get('vibes')}. Theme: {p.get('theme')}."
+        if current_user:
+            try:
+                profile_res = supabase.table("business_profiles").select("*").eq("id", current_user.id).single().execute()
+                if profile_res.data:
+                    p = profile_res.data
+                    business_context = f"Brand: {p.get('business_name')}. Vibe: {p.get('vibes')}. Theme: {p.get('theme')}."
+            except Exception:
+                # Ignore if profile not found or other error for optional user
+                pass
 
         # 2. Fetch Dataset context if provided
         dataset_context = ""
