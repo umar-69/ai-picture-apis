@@ -83,6 +83,24 @@ async def analyze_dataset_images(
     if not actual_dataset_id:
         raise HTTPException(status_code=400, detail="dataset_id is required")
     
+    # Ensure dataset exists to satisfy FK constraint
+    try:
+        # Check if dataset exists
+        ds_check = supabase.table("datasets").select("id").eq("id", actual_dataset_id).execute()
+        if not ds_check.data:
+            # Create it if missing
+            # Use current_user.id if available, else a random UUID (assuming no strict FK on user_id to auth.users or using service role)
+            owner_id = current_user.id if current_user else str(uuid.uuid4())
+            new_dataset = {
+                "id": actual_dataset_id,
+                "user_id": owner_id,
+                "name": "Untitled Dataset"
+            }
+            supabase.table("datasets").insert(new_dataset).execute()
+            print(f"Created missing dataset: {actual_dataset_id}")
+    except Exception as e:
+        print(f"Warning: Could not check/create dataset: {e}")
+
     if not files:
          raise HTTPException(status_code=400, detail="No files provided. Please upload at least one image.")
 
@@ -116,8 +134,12 @@ async def analyze_dataset_images(
             analysis_result = {}
             if GOOGLE_API_KEY:
                 try:
-                    # Use gemini-3-flash for state-of-the-art vision analysis
-                    model = genai.GenerativeModel('gemini-3-flash')
+                    # Use gemini-3-flash-preview for state-of-the-art vision analysis with code execution
+                    # We enable code_execution to allow the model to run code for better reasoning (Agentic Vision)
+                    model = genai.GenerativeModel(
+                        'gemini-3-flash-preview',
+                        tools=[{'code_execution': {}}]
+                    )
                     
                     # Prepare the image part
                     image_part = {
@@ -133,12 +155,17 @@ async def analyze_dataset_images(
                     - "colors": Dominant colors or color palette.
                     - "vibe": The overall mood or atmosphere.
                     
+                    You can use code execution to inspect the image details if needed (e.g. counting objects, checking pixel distributions), 
+                    but the final output must be the JSON structure above.
+                    
                     Ensure the output is valid JSON. Do not include markdown formatting like ```json.
                     """
                     
                     response = model.generate_content([prompt, image_part])
                     
                     # Parse the response
+                    # With code execution, the response might contain multiple parts. 
+                    # We need to extract the text part.
                     response_text = response.text.strip()
                     # Clean up markdown code blocks if present
                     if response_text.startswith("```json"):
@@ -207,7 +234,7 @@ async def analyze_style(
     current_user = Depends(get_current_user),
 ):
     try:
-        model = genai.GenerativeModel('gemini-pro-vision')
+        model = genai.GenerativeModel('gemini-3-flash-preview')
         
         # In reality, we'd need to download the images from URLs and pass them to the model
         # prompt = "Analyze these images and extract a master style prompt including lighting, colors, and vibe."
