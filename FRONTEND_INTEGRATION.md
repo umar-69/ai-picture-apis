@@ -37,8 +37,9 @@ async function uploadAndAnalyzeImages(datasetId: string, files: File[]) {
     const response = await fetch('https://ai-picture-apis.onrender.com/ai/dataset/analyze', {
       method: 'POST',
       headers: {
-        // Authorization header is required if the endpoint is protected
-        'Authorization': `Bearer ${your_access_token}`, 
+        // Authorization header is required. 
+        // Get this from `supabase.auth.getSession()` -> `session.access_token`
+        'Authorization': `Bearer ${session.access_token}`, 
         // Do NOT set 'Content-Type': 'multipart/form-data' manually!
         // The browser sets it automatically with the correct boundary.
       },

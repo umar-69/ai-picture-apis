@@ -3,7 +3,7 @@ from fastapi import APIRouter, Depends, HTTPException, status, UploadFile, File,
 from typing import List
 import uuid
 from app.schemas import GenerateImageRequest, AnalyzeImageRequest
-from app.dependencies import get_current_user, get_supabase
+from app.dependencies import get_current_user, get_current_user_optional, get_supabase
 from app.config import GOOGLE_API_KEY
 from supabase import Client
 import os
@@ -58,12 +58,16 @@ async def generate_image(
 async def analyze_dataset_images(
     dataset_id: str = Form(...),
     files: List[UploadFile] = File(...),
-    current_user = Depends(get_current_user),
+    current_user = Depends(get_current_user_optional),
     supabase: Client = Depends(get_supabase)
 ):
     """
     Uploads images to Supabase Storage, analyzes them, and saves results to DB.
+    Allows anonymous users for free tries (frontend managed limit).
     """
+    # If current_user is None, it's an anonymous request.
+    # We allow it for free tries.
+    
     results = []
     
     for file in files:
