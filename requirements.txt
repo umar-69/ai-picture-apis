@@ -1,4 +1,4 @@
-google-generativeai
+google-genai
 fastapi
 uvicorn
 supabase
@@ -10,3 +10,5 @@ python-multipart
 pytest
 httpx
 pyjwt
+pillow
+requests
