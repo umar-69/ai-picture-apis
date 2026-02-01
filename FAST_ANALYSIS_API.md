@@ -49,11 +49,11 @@ Each item in the `results` array contains:
 - `dataset_id`: The ID of the dataset.
 - `image_url`: The URL of the analyzed image.
 - `analysis_result`: The AI-generated metadata.
-  - `description`: Detailed visual description.
-  - `tags`: List of keywords (style, subject, vibe).
-  - `lighting`: Description of lighting conditions.
-  - `colors`: Dominant colors/palette.
-  - `vibe`: Overall mood/atmosphere.
+  - `description`: Brief description highlighting unique design features.
+  - `tags`: **Exactly 5 specific visual elements** (e.g., 'Marble Countertop', 'Warm Neon', 'Industrial Pipes', 'Exposed Brick', 'Edison Bulbs').
+  - `lighting`: Specific lighting type and characteristics.
+  - `colors`: Dominant colors or materials.
+  - `vibe`: Overall mood and atmosphere.
 
 **Example Response:**
 
@@ -64,20 +64,20 @@ Each item in the `results` array contains:
       "dataset_id": "d3bfce6e-75fb-4b2b-a7a1-7d14b3dd9c7a",
       "image_url": "https://your-project.supabase.co/storage/v1/object/public/dataset-images/img1.jpg",
       "analysis_result": {
-        "description": "A close-up photograph of a variety of pastries and a latte served on a wooden board...",
+        "description": "Cafe scene featuring artisan pastries on rustic wooden board atop marble table with gold veining",
         "tags": [
-          "cafe",
-          "coffee culture",
-          "pastries",
-          "latte art",
-          "cozy"
+          "Black Marble Table",
+          "Checkered Woven Chairs",
+          "Artisan Pastries",
+          "Latte Art",
+          "Gold Veining"
         ],
-        "lighting": "Soft, diffused natural lighting...",
+        "lighting": "Soft diffused natural lighting with gentle shadows",
         "colors": [
-          "Dark brown",
-          "Black",
-          "Gold",
-          "Creamy white"
+          "Black Marble",
+          "Gold Accents",
+          "Cream Checkered Pattern",
+          "Golden Brown Pastries"
         ],
         "vibe": "Sophisticated, cozy, and indulgent."
       },

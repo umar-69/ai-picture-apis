@@ -410,15 +410,15 @@ async def analyze_dataset_images_fast(
     # Reuse HTTP client for better performance
     http_client = httpx.AsyncClient(timeout=30.0, limits=httpx.Limits(max_connections=50))
     
-    # Shorter, optimized prompt for faster processing
-    prompt = """Analyze this image. Return JSON with:
-- "description": Brief description of content and style
-- "tags": 5-10 keywords (style, subject, vibe)
-- "lighting": Lighting type
-- "colors": Dominant colors
-- "vibe": Overall mood
+    # Optimized prompt focused on unique visual elements
+    prompt = """Analyze this image and identify unique, specific visual design elements, materials, or lighting features. Return JSON with:
+- "tags": Exactly 5 specific visual elements (e.g., 'Marble Countertop', 'Warm Neon', 'Industrial Pipes', 'Exposed Brick', 'Edison Bulbs')
+- "description": Brief description highlighting unique design features
+- "lighting": Specific lighting type and characteristics
+- "colors": Dominant colors or materials
+- "vibe": Overall mood and atmosphere
 
-Output valid JSON only."""
+Focus on distinctive, tangible elements that define the space or subject. Output valid JSON only."""
 
     async def process_single_image(image_url):
         try:
