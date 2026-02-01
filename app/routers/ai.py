@@ -8,7 +8,7 @@ import base64
 import requests
 import io
 from PIL import Image as PILImage
-from app.schemas import GenerateImageRequest, AnalyzeImageRequest
+from app.schemas import GenerateImageRequest, AnalyzeImageRequest, AnalyzeDatasetRequest
 from app.dependencies import get_current_user, get_current_user_optional, get_supabase, get_supabase_admin
 from app.config import GOOGLE_API_KEY
 from supabase import Client
@@ -377,6 +377,111 @@ async def analyze_dataset_images(
             continue
 
     return {"results": results}
+
+@router.post("/dataset/analyze-fast")
+async def analyze_dataset_images_fast(
+    request: AnalyzeDatasetRequest,
+    current_user = Depends(get_current_user_optional),
+    supabase: Client = Depends(get_supabase_admin)
+):
+    """
+    Fast parallel analysis of images using Gemini 3.0 Flash.
+    Accepts a list of image URLs (already in storage) and analyzes them.
+    Optimized for large quantities of images with the full detailed prompt.
+    """
+    # Ensure dataset exists
+    try:
+        ds_check = supabase.table("datasets").select("id").eq("id", request.dataset_id).execute()
+        if not ds_check.data:
+            new_dataset = {
+                "id": request.dataset_id,
+                "user_id": current_user.id if current_user else None,
+                "name": "Untitled Dataset"
+            }
+            supabase.table("datasets").insert(new_dataset).execute()
+    except Exception as e:
+        print(f"Warning: Could not check/create dataset: {e}")
+
+    if not request.image_urls:
+         raise HTTPException(status_code=400, detail="No image URLs provided.")
+
+    import asyncio
+    import httpx
+
+    async def process_single_image(image_url):
+        try:
+            # 1. Download image content
+            async with httpx.AsyncClient() as http_client:
+                resp = await http_client.get(image_url)
+                if resp.status_code != 200:
+                    return {"error": f"Failed to download image: {resp.status_code}", "image_url": image_url}
+                file_content = resp.content
+                content_type = resp.headers.get("content-type", "image/jpeg")
+
+            # 2. Analyze with Gemini 3.0 Flash
+            analysis_result = {}
+            if GOOGLE_API_KEY and client:
+                try:
+                    prompt = """
+                    Analyze this image and provide a JSON output with the following keys:
+                    - "description": A detailed description of the image content and style.
+                    - "tags": A list of 5-10 keywords describing the style, subject, and vibe.
+                    - "lighting": Description of the lighting (e.g., natural, studio, dark, bright).
+                    - "colors": Dominant colors or color palette.
+                    - "vibe": The overall mood or atmosphere.
+                    
+                    You can use code execution to inspect the image details if needed.
+                    Ensure the output is valid JSON. Do not include markdown formatting.
+                    """
+                    
+                    parts = [
+                        types.Part.from_text(text=prompt),
+                        types.Part.from_bytes(data=file_content, mime_type=content_type)
+                    ]
+                    
+                    # Using gemini-3-flash-preview for maximum speed and intelligence
+                    response = client.models.generate_content(
+                        model='gemini-3-flash-preview',
+                        contents=[types.Content(role="user", parts=parts)],
+                        config=types.GenerateContentConfig(
+                            response_mime_type="application/json"
+                        )
+                    )
+                    
+                    analysis_result = json.loads(response.text)
+                        
+                except Exception as ai_error:
+                    print(f"AI Analysis failed for {image_url}: {ai_error}")
+                    analysis_result = {"error": str(ai_error)}
+            
+            # 3. Store in DB
+            data = {
+                "dataset_id": request.dataset_id,
+                "image_url": image_url,
+                "analysis_result": analysis_result
+            }
+            
+            res = supabase.table("dataset_images").insert(data).execute()
+            return res.data[0] if res.data else None
+                
+        except Exception as e:
+            print(f"Error processing url {image_url}: {e}")
+            return {"error": str(e), "image_url": image_url}
+
+    # Process all images in parallel
+    # Limit concurrency to avoid hitting rate limits or overwhelming the server
+    semaphore = asyncio.Semaphore(10) # Process 10 images at a time
+    
+    async def sem_process(url):
+        async with semaphore:
+            return await process_single_image(url)
+
+    results = await asyncio.gather(*[sem_process(url) for url in request.image_urls])
+    
+    # Filter out None results
+    valid_results = [r for r in results if r and "error" not in r]
+    
+    return {"results": valid_results, "total_processed": len(request.image_urls), "successful": len(valid_results)}
 
 @router.get("/dataset/{dataset_id}/images")
 async def get_dataset_images(

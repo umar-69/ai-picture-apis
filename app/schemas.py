@@ -54,3 +54,7 @@ class GenerateImageRequest(BaseModel):
 
 class AnalyzeImageRequest(BaseModel):
     image_urls: List[str]
+
+class AnalyzeDatasetRequest(BaseModel):
+    dataset_id: str
+    image_urls: List[str]
