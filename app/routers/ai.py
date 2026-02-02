@@ -8,7 +8,7 @@ import base64
 import requests
 import io
 from PIL import Image as PILImage
-from app.schemas import GenerateImageRequest, AnalyzeImageRequest, AnalyzeDatasetRequest
+from app.schemas import GenerateImageRequest, AnalyzeImageRequest, AnalyzeDatasetRequest, UpdateDatasetTrainingStatusRequest
 from app.dependencies import get_current_user, get_current_user_optional, get_supabase, get_supabase_admin
 from app.config import GOOGLE_API_KEY
 from supabase import Client
@@ -54,6 +54,7 @@ async def generate_image(
         dataset_context = ""
         dataset_master_prompt = ""
         reference_images = []
+        unique_visual_elements = []
         
         if request.dataset_id:
             try:
@@ -69,15 +70,27 @@ async def generate_image(
                     images_res = supabase.table("dataset_images").select("image_url, analysis_result").eq("dataset_id", request.dataset_id).limit(5).execute()
                     
                     if images_res.data:
-                        # Extract style information from analyzed images for text context
-                        style_tags = []
+                        # Extract unique visual elements and style information from analyzed images
+                        all_tags = []
+                        vibes = []
+                        lighting_styles = []
+                        colors = []
+                        
                         for img in images_res.data:
                             if img.get('analysis_result'):
                                 analysis = img['analysis_result']
+                                
+                                # Extract specific visual elements from tags (these are the unique tangible elements)
+                                if 'tags' in analysis and isinstance(analysis['tags'], list):
+                                    all_tags.extend(analysis['tags'])
+                                
+                                # Extract vibe, lighting, and colors for additional context
                                 if 'vibe' in analysis:
-                                    style_tags.append(analysis['vibe'])
+                                    vibes.append(analysis['vibe'])
                                 if 'lighting' in analysis:
-                                    style_tags.append(analysis['lighting'])
+                                    lighting_styles.append(analysis['lighting'])
+                                if 'colors' in analysis:
+                                    colors.append(analysis['colors'])
                             
                             # Download the actual image to use as visual reference
                             if img.get('image_url'):
@@ -93,26 +106,65 @@ async def generate_image(
                                     print(f"Warning: Could not load reference image {img.get('image_url')}: {img_error}")
                                     # Continue with other images
                         
-                        if style_tags:
-                            dataset_context += f"Reference style: {', '.join(set(style_tags))}. "
+                        # Build unique visual elements list (remove duplicates, keep most common)
+                        if all_tags:
+                            # Count frequency and get unique elements
+                            from collections import Counter
+                            tag_counts = Counter(all_tags)
+                            # Get top unique elements (sorted by frequency)
+                            unique_visual_elements = [tag for tag, count in tag_counts.most_common(10)]
+                            print(f"Extracted unique visual elements: {unique_visual_elements}")
+                        
+                        # Build comprehensive dataset context with unique elements
+                        if unique_visual_elements:
+                            dataset_context += f"UNIQUE VISUAL ELEMENTS: {', '.join(unique_visual_elements)}. "
+                        
+                        if vibes:
+                            unique_vibes = list(set(vibes))
+                            dataset_context += f"Vibe: {', '.join(unique_vibes)}. "
+                        
+                        if lighting_styles:
+                            unique_lighting = list(set(lighting_styles))
+                            dataset_context += f"Lighting: {', '.join(unique_lighting)}. "
+                        
+                        if colors:
+                            unique_colors = list(set(colors))
+                            dataset_context += f"Colors: {', '.join(unique_colors)}. "
                         
                         if reference_images:
-                            dataset_context += f"Match the style and aesthetic of the {len(reference_images)} reference image(s) provided. "
+                            dataset_context += f"Strictly replicate the interior design, textures, materials, and layout seen in the {len(reference_images)} reference image(s). "
                             
             except Exception as e:
                 print(f"Warning: Could not fetch dataset context: {e}")
                 # Continue anyway - dataset context is optional
 
-        # 3. Build the full prompt with context
-        style_suffix = ""
-        if request.style:
-            style_suffix = f" Style: {request.style}."
-        
-        full_prompt = f"{business_context}{dataset_context}{request.prompt}{style_suffix}".strip()
+        # 3. Build the full prompt with system instruction format
+        # Create a structured prompt that emphasizes unique visual elements from the dataset
+        if reference_images and unique_visual_elements:
+            # Build system instruction with unique visual elements
+            system_instruction = f"""TASK: Generate a photorealistic professional marketing image for this specific brand location.
+STYLE: Strictly replicate the interior design, textures, lighting, and layout seen in the provided reference images.
+UNIQUE ELEMENTS TO INCLUDE: {', '.join(unique_visual_elements[:8])}
+{dataset_context}
+SCENE: {request.prompt}"""
+            
+            if request.style:
+                system_instruction += f"\nADDITIONAL STYLE: {request.style}"
+            
+            full_prompt = system_instruction
+        else:
+            # Fallback to simpler prompt if no dataset
+            style_suffix = ""
+            if request.style:
+                style_suffix = f" Style: {request.style}."
+            
+            full_prompt = f"{business_context}{dataset_context}{request.prompt}{style_suffix}".strip()
         
         print(f"Generating image with Nano Banana Pro (Gemini 3). Prompt: {full_prompt}")
         if reference_images:
             print(f"Using {len(reference_images)} reference images from dataset")
+        if unique_visual_elements:
+            print(f"Incorporating {len(unique_visual_elements)} unique visual elements")
         
         # 4. Generate image using Nano Banana Pro (Gemini 3 Pro Image Preview)
         if not client:
@@ -512,6 +564,59 @@ async def get_dataset_images(
         return {"images": res.data}
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
+
+@router.patch("/dataset/{dataset_id}/training-status")
+async def update_dataset_training_status(
+    dataset_id: str,
+    training_status: str = Form(...),
+    current_user = Depends(get_current_user_optional),
+    supabase: Client = Depends(get_supabase_admin)
+):
+    """
+    Update the training status of a dataset.
+    Allows users to mark a dataset as 'trained' or 'not_trained' from the frontend.
+    This is a simple status flag to track whether the user has completed training on this dataset.
+    """
+    # Validate training_status
+    if training_status not in ["trained", "not_trained"]:
+        raise HTTPException(
+            status_code=400, 
+            detail="training_status must be either 'trained' or 'not_trained'"
+        )
+    
+    try:
+        # Check if dataset exists
+        ds_check = supabase.table("datasets").select("id, user_id").eq("id", dataset_id).execute()
+        
+        if not ds_check.data:
+            raise HTTPException(status_code=404, detail="Dataset not found")
+        
+        dataset = ds_check.data[0]
+        
+        # Optional: Verify ownership if user is logged in
+        if current_user and dataset.get("user_id") and dataset["user_id"] != current_user.id:
+            raise HTTPException(status_code=403, detail="You don't have permission to update this dataset")
+        
+        # Update the training status
+        update_res = supabase.table("datasets").update({
+            "training_status": training_status
+        }).eq("id", dataset_id).execute()
+        
+        if not update_res.data:
+            raise HTTPException(status_code=500, detail="Failed to update training status")
+        
+        return {
+            "success": True,
+            "dataset_id": dataset_id,
+            "training_status": training_status,
+            "message": f"Dataset training status updated to '{training_status}'"
+        }
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"Error updating training status: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to update training status: {str(e)}")
 
 @router.post("/analyze")
 async def analyze_style(

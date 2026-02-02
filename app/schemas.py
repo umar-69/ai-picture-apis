@@ -58,3 +58,7 @@ class AnalyzeImageRequest(BaseModel):
 class AnalyzeDatasetRequest(BaseModel):
     dataset_id: str
     image_urls: List[str]
+
+class UpdateDatasetTrainingStatusRequest(BaseModel):
+    dataset_id: str
+    training_status: str  # "trained" or "not_trained"
