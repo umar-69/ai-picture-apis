@@ -249,32 +249,46 @@ SCENE: {request.prompt}"""
         # 7. Get public URL
         public_url = supabase.storage.from_("generated-images").get_public_url(file_path)
         
-        # 8. Optionally save generation record to database
-        if current_user:
-            try:
-                generation_record = {
-                    "user_id": current_user.id,
-                    "prompt": request.prompt,
-                    "full_prompt": full_prompt,
-                    "image_url": public_url,
-                    "dataset_id": request.dataset_id,
-                    "style": request.style,
-                    "aspect_ratio": request.aspect_ratio
-                }
-                # Note: You may want to create a 'generated_images' table to track this
-                # supabase.table("generated_images").insert(generation_record).execute()
-            except Exception as db_error:
-                print(f"Warning: Could not save generation record: {db_error}")
-                # Continue anyway - the image was generated successfully
+        # 8. Save generation record to database with full metadata
+        generation_id = None
+        try:
+            generation_record = {
+                "user_id": current_user.id if current_user else None,
+                "prompt": request.prompt,
+                "full_prompt": full_prompt,
+                "image_url": public_url,
+                "dataset_id": request.dataset_id,
+                "style": request.style,
+                "aspect_ratio": request.aspect_ratio,
+                "quality": request.quality,
+                "format": request.format,
+                "resolution": resolution,
+                "reference_images_count": len(reference_images),
+                "unique_visual_elements": unique_visual_elements if unique_visual_elements else None
+            }
+            
+            # Insert generation record into database
+            result = supabase.table("generated_images").insert(generation_record).execute()
+            if result.data:
+                generation_id = result.data[0].get('id')
+                print(f"Saved generation record with ID: {generation_id}")
+        except Exception as db_error:
+            print(f"Warning: Could not save generation record: {db_error}")
+            # Continue anyway - the image was generated successfully
         
-        # 9. Return the image URL (this is what the frontend expects!)
+        # 9. Return the image URL and metadata (this is what the frontend expects!)
         return {
+            "id": generation_id,
             "image_url": public_url,
             "caption": request.prompt,
             "prompt_used": full_prompt,
             "dataset_id": request.dataset_id,
             "style": request.style,
-            "aspect_ratio": request.aspect_ratio
+            "aspect_ratio": request.aspect_ratio,
+            "quality": request.quality,
+            "format": request.format,
+            "resolution": resolution,
+            "reference_images_count": len(reference_images)
         }
         
     except HTTPException:
@@ -285,6 +299,73 @@ SCENE: {request.prompt}"""
         import traceback
         traceback.print_exc()
         raise HTTPException(status_code=500, detail=f"Image generation failed: {str(e)}")
+
+@router.get("/generated-images")
+async def get_generated_images(
+    limit: int = 50,
+    offset: int = 0,
+    dataset_id: str = None,
+    current_user = Depends(get_current_user_optional),
+    supabase: Client = Depends(get_supabase_admin)
+):
+    """
+    Retrieve generated images history with all metadata.
+    Supports filtering by dataset_id and pagination.
+    Returns: list of generated images with prompts, URLs, and generation details.
+    """
+    try:
+        query = supabase.table("generated_images").select("*")
+        
+        # Filter by user if authenticated
+        if current_user:
+            query = query.eq("user_id", current_user.id)
+        
+        # Filter by dataset if provided
+        if dataset_id:
+            query = query.eq("dataset_id", dataset_id)
+        
+        # Apply pagination and ordering
+        query = query.order("created_at", desc=True).range(offset, offset + limit - 1)
+        
+        result = query.execute()
+        
+        return {
+            "images": result.data,
+            "count": len(result.data),
+            "offset": offset,
+            "limit": limit
+        }
+    except Exception as e:
+        print(f"Error fetching generated images: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to fetch generated images: {str(e)}")
+
+@router.get("/generated-images/{image_id}")
+async def get_generated_image_by_id(
+    image_id: str,
+    current_user = Depends(get_current_user_optional),
+    supabase: Client = Depends(get_supabase_admin)
+):
+    """
+    Retrieve a specific generated image by ID with all metadata.
+    """
+    try:
+        query = supabase.table("generated_images").select("*").eq("id", image_id)
+        
+        # Filter by user if authenticated
+        if current_user:
+            query = query.eq("user_id", current_user.id)
+        
+        result = query.single().execute()
+        
+        if not result.data:
+            raise HTTPException(status_code=404, detail="Generated image not found")
+        
+        return result.data
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"Error fetching generated image: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to fetch generated image: {str(e)}")
 
 @router.post("/dataset/analyze")
 async def analyze_dataset_images(
