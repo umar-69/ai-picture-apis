@@ -54,6 +54,8 @@ class GenerateImageRequest(BaseModel):
     quality: Optional[str] = "standard"
     format: Optional[str] = "png"
     dataset_id: Optional[str] = None
+    environment_id: Optional[str] = None  # UUID of @-mentioned environment
+    folder_id: Optional[str] = None       # UUID of @-mentioned folder (maps to datasets.id)
 
 class AnalyzeImageRequest(BaseModel):
     image_urls: List[str]

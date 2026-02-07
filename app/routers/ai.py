@@ -104,24 +104,30 @@ async def generate_image(
                 # Ignore if profile not found or other error for optional user
                 pass
 
-        # 2. Fetch Dataset context if provided (including actual images as visual reference)
+        # 2. Resolve the effective dataset_id from folder_id or dataset_id
+        # folder_id maps to datasets.id - when provided, it takes priority
+        effective_dataset_id = request.folder_id or request.dataset_id
+        
+        # 2a. Fetch Dataset/Folder context if provided (including actual images as visual reference)
         dataset_context = ""
         dataset_master_prompt = ""
         reference_images = []
         unique_visual_elements = []
+        folder_name = ""
         
-        if request.dataset_id:
+        if effective_dataset_id:
             try:
                 # Fetch dataset and its analyzed images for style reference
-                dataset_res = supabase.table("datasets").select("*").eq("id", request.dataset_id).single().execute()
+                dataset_res = supabase.table("datasets").select("*").eq("id", effective_dataset_id).single().execute()
                 if dataset_res.data:
+                    folder_name = dataset_res.data.get('name', '')
                     dataset_master_prompt = dataset_res.data.get('master_prompt', '')
                     if dataset_master_prompt:
                         dataset_context = f"Style Guidelines: {dataset_master_prompt}. "
                     
                     # Fetch actual images from dataset to use as visual reference
                     # Nano Banana supports up to 14 reference images (up to 6 objects, up to 5 people)
-                    images_res = supabase.table("dataset_images").select("image_url, analysis_result").eq("dataset_id", request.dataset_id).limit(5).execute()
+                    images_res = supabase.table("dataset_images").select("image_url, analysis_result").eq("dataset_id", effective_dataset_id).limit(5).execute()
                     
                     if images_res.data:
                         # Extract unique visual elements and style information from analyzed images
@@ -129,6 +135,7 @@ async def generate_image(
                         vibes = []
                         lighting_styles = []
                         colors = []
+                        all_descriptions = []
                         
                         for img in images_res.data:
                             if img.get('analysis_result'):
@@ -137,6 +144,10 @@ async def generate_image(
                                 # Extract specific visual elements from tags (these are the unique tangible elements)
                                 if 'tags' in analysis and isinstance(analysis['tags'], list):
                                     all_tags.extend(analysis['tags'])
+                                
+                                # Extract description for brand reference context
+                                if 'description' in analysis:
+                                    all_descriptions.append(analysis['description'])
                                 
                                 # Extract vibe, lighting, and colors for additional context
                                 if 'vibe' in analysis:
@@ -170,27 +181,72 @@ async def generate_image(
                             print(f"Extracted unique visual elements: {unique_visual_elements}")
                         
                         # Build comprehensive dataset context with unique elements
-                        if unique_visual_elements:
-                            dataset_context += f"UNIQUE VISUAL ELEMENTS: {', '.join(unique_visual_elements)}. "
-                        
-                        if vibes:
-                            unique_vibes = list(set(vibes))
-                            dataset_context += f"Vibe: {', '.join(unique_vibes)}. "
-                        
-                        if lighting_styles:
-                            unique_lighting = list(set(lighting_styles))
-                            dataset_context += f"Lighting: {', '.join(unique_lighting)}. "
-                        
-                        if colors:
-                            unique_colors = list(set(colors))
-                            dataset_context += f"Colors: {', '.join(unique_colors)}. "
-                        
-                        if reference_images:
-                            dataset_context += f"Strictly replicate the interior design, textures, materials, and layout seen in the {len(reference_images)} reference image(s). "
+                        # When folder_id was explicitly provided via @-mention, add richer brand context
+                        if request.folder_id and folder_name:
+                            dataset_context = f"--- Brand Reference: {folder_name} ---\n"
+                            if dataset_master_prompt:
+                                dataset_context += f"Master Style Prompt: {dataset_master_prompt}\n"
+                            if all_descriptions:
+                                dataset_context += "Reference Image Analysis:\n"
+                                for desc in all_descriptions[:5]:
+                                    dataset_context += f"- {desc}\n"
+                            if unique_visual_elements:
+                                dataset_context += f"Visual Style Tags: {', '.join(unique_visual_elements)}\n"
+                            if colors:
+                                unique_colors = list(set(colors))
+                                dataset_context += f"Color Palette: {', '.join(unique_colors)}\n"
+                            if vibes:
+                                unique_vibes = list(set(vibes))
+                                dataset_context += f"Vibe: {', '.join(unique_vibes)}\n"
+                            if lighting_styles:
+                                unique_lighting = list(set(lighting_styles))
+                                dataset_context += f"Lighting: {', '.join(unique_lighting)}\n"
+                            if reference_images:
+                                dataset_context += f"Strictly replicate the interior design, textures, materials, and layout seen in the {len(reference_images)} reference image(s).\n"
+                        else:
+                            # Original dataset_id-only behavior (no @-mention)
+                            if unique_visual_elements:
+                                dataset_context += f"UNIQUE VISUAL ELEMENTS: {', '.join(unique_visual_elements)}. "
+                            
+                            if vibes:
+                                unique_vibes = list(set(vibes))
+                                dataset_context += f"Vibe: {', '.join(unique_vibes)}. "
+                            
+                            if lighting_styles:
+                                unique_lighting = list(set(lighting_styles))
+                                dataset_context += f"Lighting: {', '.join(unique_lighting)}. "
+                            
+                            if colors:
+                                unique_colors = list(set(colors))
+                                dataset_context += f"Colors: {', '.join(unique_colors)}. "
+                            
+                            if reference_images:
+                                dataset_context += f"Strictly replicate the interior design, textures, materials, and layout seen in the {len(reference_images)} reference image(s). "
                             
             except Exception as e:
                 print(f"Warning: Could not fetch dataset context: {e}")
                 # Continue anyway - dataset context is optional
+        
+        # 2b. If environment_id is provided WITHOUT a specific folder, gather broad brand context
+        #     from ALL trained folders in that environment
+        environment_context = ""
+        if request.environment_id and not effective_dataset_id:
+            try:
+                env_folders_res = supabase.table("datasets").select("name, master_prompt, training_status").eq("environment_id", request.environment_id).eq("training_status", "trained").execute()
+                if env_folders_res.data:
+                    # Look up environment name
+                    env_res = supabase.table("environments").select("name").eq("id", request.environment_id).single().execute()
+                    env_name = env_res.data.get('name', 'Environment') if env_res.data else 'Environment'
+                    
+                    environment_context = f"--- Brand Context: {env_name} ---\n"
+                    for folder in env_folders_res.data:
+                        if folder.get('master_prompt'):
+                            environment_context += f"[{folder['name']}]: {folder['master_prompt']}\n"
+                    
+                    print(f"Added environment-wide brand context from {len(env_folders_res.data)} trained folders")
+            except Exception as e:
+                print(f"Warning: Could not fetch environment context: {e}")
+                # Continue anyway - environment context is optional
 
         # 3. Build the full prompt with system instruction format
         # Create a structured prompt that emphasizes unique visual elements from the dataset
@@ -212,7 +268,12 @@ SCENE: {request.prompt}"""
             if request.style:
                 style_suffix = f" Style: {request.style}."
             
-            full_prompt = f"{business_context}{dataset_context}{request.prompt}{style_suffix}".strip()
+            # Include environment_context when available (broad brand context without specific folder)
+            all_context = f"{business_context}{environment_context}{dataset_context}".strip()
+            if all_context:
+                full_prompt = f"{all_context}\n\n{request.prompt}{style_suffix}".strip()
+            else:
+                full_prompt = f"{request.prompt}{style_suffix}".strip()
         
         print(f"Generating image with Nano Banana Pro (Gemini 3). Prompt: {full_prompt}")
         if reference_images:
@@ -311,7 +372,8 @@ SCENE: {request.prompt}"""
                 "prompt": request.prompt,
                 "full_prompt": full_prompt,
                 "image_url": public_url,
-                "dataset_id": request.dataset_id,
+                "dataset_id": effective_dataset_id,
+                "environment_id": request.environment_id,
                 "style": request.style,
                 "aspect_ratio": request.aspect_ratio,
                 "quality": request.quality,
@@ -346,7 +408,9 @@ SCENE: {request.prompt}"""
             "image_url": public_url,
             "caption": request.prompt,
             "prompt_used": full_prompt,
-            "dataset_id": request.dataset_id,
+            "dataset_id": effective_dataset_id,
+            "environment_id": request.environment_id,
+            "folder_id": request.folder_id,
             "style": request.style,
             "aspect_ratio": request.aspect_ratio,
             "quality": request.quality,
