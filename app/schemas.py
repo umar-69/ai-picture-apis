@@ -1,5 +1,6 @@
-from pydantic import BaseModel, EmailStr
+from pydantic import BaseModel, EmailStr, ConfigDict
 from typing import Optional, Any, List
+from datetime import datetime
 
 class UserSignup(BaseModel):
     email: EmailStr
@@ -11,10 +12,12 @@ class UserLogin(BaseModel):
     password: str
 
 class UserResponse(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+    
     id: str
     email: Optional[str] = None
-    created_at: Optional[str] = None
-    last_sign_in_at: Optional[str] = None
+    created_at: Optional[Any] = None
+    last_sign_in_at: Optional[Any] = None
     app_metadata: Optional[dict] = None
     user_metadata: Optional[dict] = None
 
@@ -62,3 +65,92 @@ class AnalyzeDatasetRequest(BaseModel):
 class UpdateDatasetTrainingStatusRequest(BaseModel):
     dataset_id: str
     training_status: str  # "trained" or "not_trained"
+
+
+# ─── User Profile ───────────────────────────────────────────────
+
+class UserProfileUpdate(BaseModel):
+    first_name: Optional[str] = None
+    last_name: Optional[str] = None
+    creative_type: Optional[str] = None  # photographer, designer, marketer, artist, etc.
+    use_case: Optional[str] = None
+    avatar_url: Optional[str] = None
+
+class UserProfileResponse(BaseModel):
+    id: str
+    first_name: Optional[str] = None
+    last_name: Optional[str] = None
+    creative_type: Optional[str] = None
+    use_case: Optional[str] = None
+    avatar_url: Optional[str] = None
+    updated_at: Optional[str] = None
+    created_at: Optional[str] = None
+
+
+# ─── Plans ───────────────────────────────────────────────────────
+
+class PlanResponse(BaseModel):
+    id: str
+    name: str
+    credit_limit: int
+    price_monthly: float
+    features: Optional[List[str]] = None
+    created_at: Optional[str] = None
+
+
+# ─── Subscriptions ───────────────────────────────────────────────
+
+class SubscriptionResponse(BaseModel):
+    id: str
+    user_id: str
+    plan_id: str
+    status: str
+    stripe_subscription_id: Optional[str] = None
+    current_period_start: Optional[str] = None
+    current_period_end: Optional[str] = None
+    created_at: Optional[str] = None
+    plan: Optional[PlanResponse] = None  # joined plan details
+
+
+# ─── Credit Balance ──────────────────────────────────────────────
+
+class CreditBalanceResponse(BaseModel):
+    user_id: str
+    total_credits: int
+    used_credits: int
+    remaining_credits: int
+    last_reset_at: Optional[str] = None
+    updated_at: Optional[str] = None
+
+
+# ─── Credit Transactions ────────────────────────────────────────
+
+class CreditTransactionResponse(BaseModel):
+    id: str
+    user_id: str
+    amount: int
+    type: str
+    description: Optional[str] = None
+    metadata: Optional[dict] = None
+    created_at: Optional[str] = None
+
+
+# ─── Usage Logs ──────────────────────────────────────────────────
+
+class UsageLogResponse(BaseModel):
+    id: str
+    user_id: str
+    action_type: str
+    prompt: Optional[str] = None
+    credits_used: int
+    metadata: Optional[dict] = None
+    created_at: Optional[str] = None
+
+
+# ─── Account Summary (combined dashboard view) ──────────────────
+
+class AccountSummaryResponse(BaseModel):
+    profile: Optional[UserProfileResponse] = None
+    subscription: Optional[SubscriptionResponse] = None
+    credits: Optional[CreditBalanceResponse] = None
+    recent_usage: Optional[List[UsageLogResponse]] = None

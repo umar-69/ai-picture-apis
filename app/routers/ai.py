@@ -21,6 +21,60 @@ if GOOGLE_API_KEY:
 
 router = APIRouter(prefix="/ai", tags=["AI"])
 
+# ─── Credit cost per action ──────────────────────────────────────
+CREDIT_COSTS = {
+    "generate_image": 5,
+    "analyze_image": 2,
+    "analyze_dataset_per_image": 1,
+}
+
+def _deduct_credits(supabase: Client, user_id: str, action_type: str, credits: int, prompt: str = None, metadata: dict = None):
+    """Deduct credits from user balance and log the transaction + usage."""
+    try:
+        # 1. Get current balance
+        bal_res = supabase.table("credit_balances").select("*").eq("user_id", user_id).execute()
+        if not bal_res.data:
+            return  # no balance row = skip (shouldn't happen for registered users)
+        
+        balance = bal_res.data[0]
+        remaining = balance["remaining_credits"]
+        
+        if remaining < credits:
+            raise HTTPException(
+                status_code=402,
+                detail=f"Insufficient credits. Need {credits}, have {remaining}. Upgrade your plan for more credits."
+            )
+        
+        # 2. Update balance
+        supabase.table("credit_balances").update({
+            "used_credits": balance["used_credits"] + credits,
+            "remaining_credits": remaining - credits,
+            "updated_at": "now()"
+        }).eq("user_id", user_id).execute()
+        
+        # 3. Log credit transaction
+        supabase.table("credit_transactions").insert({
+            "user_id": user_id,
+            "amount": -credits,
+            "type": "generation" if "generat" in action_type else "analysis",
+            "description": f"{action_type}: -{credits} credits",
+            "metadata": metadata or {}
+        }).execute()
+        
+        # 4. Log usage
+        supabase.table("usage_logs").insert({
+            "user_id": user_id,
+            "action_type": action_type,
+            "prompt": prompt,
+            "credits_used": credits,
+            "metadata": metadata or {}
+        }).execute()
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"Warning: Credit deduction failed: {e}")
+        # Don't block the action if credit logging fails
+
 @router.post("/generate")
 async def generate_image(
     request: GenerateImageRequest,
@@ -276,7 +330,17 @@ SCENE: {request.prompt}"""
             print(f"Warning: Could not save generation record: {db_error}")
             # Continue anyway - the image was generated successfully
         
-        # 9. Return the image URL and metadata (this is what the frontend expects!)
+        # 9. Deduct credits if user is logged in
+        if current_user:
+            _deduct_credits(
+                supabase, str(current_user.id),
+                action_type="generate_image",
+                credits=CREDIT_COSTS["generate_image"],
+                prompt=request.prompt,
+                metadata={"generation_id": generation_id, "resolution": resolution}
+            )
+        
+        # 10. Return the image URL and metadata (this is what the frontend expects!)
         return {
             "id": generation_id,
             "image_url": public_url,
@@ -288,7 +352,8 @@ SCENE: {request.prompt}"""
             "quality": request.quality,
             "format": request.format,
             "resolution": resolution,
-            "reference_images_count": len(reference_images)
+            "reference_images_count": len(reference_images),
+            "credits_used": CREDIT_COSTS["generate_image"] if current_user else 0
         }
         
     except HTTPException:
@@ -509,7 +574,18 @@ async def analyze_dataset_images(
             # We continue processing other files even if one fails
             continue
 
-    return {"results": results}
+    # Deduct credits for analyzed images (1 credit per image)
+    if current_user and results:
+        total_credits = len(results) * CREDIT_COSTS["analyze_dataset_per_image"]
+        _deduct_credits(
+            supabase, str(current_user.id),
+            action_type="analyze_dataset",
+            credits=total_credits,
+            prompt=f"Analyzed {len(results)} images in dataset {actual_dataset_id}",
+            metadata={"dataset_id": actual_dataset_id, "images_analyzed": len(results)}
+        )
+
+    return {"results": results, "credits_used": len(results) * CREDIT_COSTS["analyze_dataset_per_image"] if current_user else 0}
 
 @router.post("/dataset/analyze-fast")
 async def analyze_dataset_images_fast(
@@ -616,10 +692,22 @@ Focus on distinctive, tangible elements that define the space or subject. Output
         # Filter out error results
         valid_results = [r for r in results if r and "error" not in r]
         
+        # Deduct credits for successfully analyzed images
+        if current_user and valid_results:
+            total_credits = len(valid_results) * CREDIT_COSTS["analyze_dataset_per_image"]
+            _deduct_credits(
+                supabase, str(current_user.id),
+                action_type="analyze_dataset_fast",
+                credits=total_credits,
+                prompt=f"Fast-analyzed {len(valid_results)} images in dataset {request.dataset_id}",
+                metadata={"dataset_id": request.dataset_id, "images_analyzed": len(valid_results)}
+            )
+        
         return {
             "results": valid_results, 
             "total_processed": len(request.image_urls), 
-            "successful": len(valid_results)
+            "successful": len(valid_results),
+            "credits_used": len(valid_results) * CREDIT_COSTS["analyze_dataset_per_image"] if current_user else 0
         }
     
     finally:
