@@ -154,3 +154,36 @@ class AccountSummaryResponse(BaseModel):
     subscription: Optional[SubscriptionResponse] = None
     credits: Optional[CreditBalanceResponse] = None
     recent_usage: Optional[List[UsageLogResponse]] = None
+
+
+# ─── Environments ────────────────────────────────────────────────
+
+class EnvironmentCreate(BaseModel):
+    name: str
+
+class EnvironmentUpdate(BaseModel):
+    name: str
+
+class EnvironmentResponse(BaseModel):
+    id: str
+    user_id: str
+    name: str
+    created_at: Optional[str] = None
+
+
+# ─── Folders (Datasets within Environments) ──────────────────────
+
+class FolderCreate(BaseModel):
+    name: str
+
+class FolderUpdate(BaseModel):
+    name: str
+
+class FolderResponse(BaseModel):
+    id: str
+    name: str
+    environment_id: Optional[str] = None
+    user_id: Optional[str] = None
+    training_status: Optional[str] = None
+    master_prompt: Optional[str] = None
+    created_at: Optional[str] = None

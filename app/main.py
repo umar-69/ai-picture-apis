@@ -1,6 +1,6 @@
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-from app.routers import auth, users, storage, business, ai, account
+from app.routers import auth, users, storage, business, ai, account, environments
 
 app = FastAPI(title="AI Picture APIs")
 
@@ -20,6 +20,7 @@ app.include_router(storage.router)
 app.include_router(business.router)
 app.include_router(ai.router)
 app.include_router(account.router)
+app.include_router(environments.router)
 
 @app.get("/")
 def root():
