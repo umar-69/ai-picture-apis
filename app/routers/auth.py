@@ -31,7 +31,7 @@ def signup(user: UserSignup, supabase: Client = Depends(get_supabase)):
 
 
 def _setup_new_account(supabase: Client, user_id: str, metadata: dict):
-    """Create user_profiles, credit_balances, and Free subscription for a new user."""
+    """Create user_profiles, credit_balances, Free subscription, and default environments for a new user."""
     try:
         # Create user profile with metadata if provided
         profile_data = {
@@ -75,9 +75,27 @@ def _setup_new_account(supabase: Client, user_id: str, metadata: dict):
                 "type": "subscription_reset",
                 "description": f"Initial {credit_limit} credits from Free plan"
             }).execute()
+
+        # Create 3 default environments for every new user
+        _create_default_environments(supabase, user_id)
+
     except Exception:
         # Don't fail signup if account setup has issues — user can still log in
         pass
+
+
+# Default environments created for every new user account
+DEFAULT_ENVIRONMENTS = ["Product", "Environment", "Character"]
+
+
+def _create_default_environments(supabase: Client, user_id: str):
+    """Create the 3 default environments (Product, Environment, Character) for a new user."""
+    try:
+        rows = [{"name": name, "user_id": user_id} for name in DEFAULT_ENVIRONMENTS]
+        supabase.table("environments").insert(rows).execute()
+    except Exception as e:
+        # Log but don't fail — environments can be created manually later
+        print(f"Warning: Could not create default environments for user {user_id}: {e}")
 
 @router.post("/login")
 def login(user: UserLogin, supabase: Client = Depends(get_supabase)):
