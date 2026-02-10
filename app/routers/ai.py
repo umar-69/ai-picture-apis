@@ -466,7 +466,7 @@ async def get_generated_images(
         }
     except Exception as e:
         print(f"Error fetching generated images: {e}")
-        raise HTTPException(status_code=500, detail=f"Failed to fetch generated images: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Failed to fetch generated image: {str(e)}")
 
 @router.get("/generated-images/{image_id}")
 async def get_generated_image_by_id(
