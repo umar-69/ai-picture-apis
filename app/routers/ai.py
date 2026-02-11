@@ -1,5 +1,6 @@
 from google import genai
 from google.genai import types
+from google.genai.errors import ServerError, APIError
 from fastapi import APIRouter, Depends, HTTPException, status, UploadFile, File, Form
 from typing import List
 import uuid
@@ -7,12 +8,179 @@ import json
 import base64
 import requests
 import io
+import time
+import asyncio
 from PIL import Image as PILImage
 from app.schemas import GenerateImageRequest, AnalyzeImageRequest, AnalyzeDatasetRequest, UpdateDatasetTrainingStatusRequest
 from app.dependencies import get_current_user, get_current_user_optional, get_supabase, get_supabase_admin
 from app.config import GOOGLE_API_KEY
 from supabase import Client
 import os
+
+# ─── Constants ────────────────────────────────────────────────────
+MAX_REFERENCE_IMAGES = 5          # Cap reference images to reduce payload
+MAX_IMAGE_DIMENSION = 1024        # Resize large images to this max width/height
+GEMINI_MAX_RETRIES = 3            # Retry transient 500 errors up to 3 times
+GEMINI_RETRY_BASE_DELAY = 2      # Base delay in seconds (exponential backoff)
+
+
+def _compute_relevance_score(prompt: str, analysis: dict) -> float:
+    """
+    Score how relevant a dataset image is to the user's prompt.
+    
+    Compares prompt words against the image's analyzed fields:
+      - tags (weight: 3x)        — most specific visual descriptors
+      - key_elements (weight: 3x) — specific design features
+      - description (weight: 2x)  — rich scene description
+      - vibe/theme (weight: 1.5x) — mood/theme match
+      - colors (weight: 1x)       — color mentions
+      - lighting (weight: 0.5x)   — lighting style
+    
+    Returns a float score (higher = more relevant).
+    """
+    if not analysis:
+        return 0.0
+    
+    # Normalize prompt: lowercase, split into meaningful words (3+ chars)
+    prompt_lower = prompt.lower()
+    prompt_words = set(w for w in prompt_lower.split() if len(w) >= 3)
+    
+    # Also create bigrams from prompt for multi-word matching (e.g. "latte art")
+    prompt_word_list = [w for w in prompt_lower.split() if len(w) >= 2]
+    prompt_bigrams = set()
+    for i in range(len(prompt_word_list) - 1):
+        prompt_bigrams.add(f"{prompt_word_list[i]} {prompt_word_list[i+1]}")
+    
+    score = 0.0
+    
+    # Helper: count how many prompt words appear in a text
+    def _word_matches(text: str) -> int:
+        if not text:
+            return 0
+        text_lower = text.lower()
+        matches = sum(1 for w in prompt_words if w in text_lower)
+        # Bonus for bigram matches (more specific)
+        matches += sum(2 for bg in prompt_bigrams if bg in text_lower)
+        return matches
+    
+    # Tags: highest signal — these are concise visual descriptors
+    tags = analysis.get('tags', [])
+    if isinstance(tags, list):
+        for tag in tags:
+            tag_lower = tag.lower()
+            # Exact tag match in prompt = strong signal
+            if tag_lower in prompt_lower:
+                score += 5.0
+            else:
+                # Partial word overlap
+                score += _word_matches(tag) * 3.0
+    
+    # Key elements: specific design features, equally high signal
+    key_elements = analysis.get('key_elements', [])
+    if isinstance(key_elements, list):
+        for elem in key_elements:
+            elem_lower = elem.lower()
+            if elem_lower in prompt_lower:
+                score += 5.0
+            else:
+                score += _word_matches(elem) * 3.0
+    
+    # Description: rich context, good for matching scene-level concepts
+    description = analysis.get('description', '')
+    score += _word_matches(description) * 2.0
+    
+    # Vibe and theme: mood-level matching
+    vibe = analysis.get('vibe', '')
+    score += _word_matches(vibe) * 1.5
+    
+    theme = analysis.get('theme', '')
+    score += _word_matches(theme) * 1.5
+    
+    # Colors: useful when prompt mentions specific colors
+    colors = analysis.get('colors', '')
+    if isinstance(colors, list):
+        colors = ', '.join(colors)
+    score += _word_matches(colors) * 1.0
+    
+    # Lighting: minor signal
+    lighting = analysis.get('lighting', '')
+    score += _word_matches(lighting) * 0.5
+    
+    return score
+
+
+def _select_relevant_images(prompt: str, images_data: list, max_images: int = MAX_REFERENCE_IMAGES) -> list:
+    """
+    Rank all dataset images by relevance to the prompt,
+    return the top max_images entries (with their analysis_result intact).
+    
+    If no image scores above 0 (i.e. prompt has no overlap with any analysis),
+    falls back to returning the first max_images images (original behavior).
+    """
+    scored = []
+    for img in images_data:
+        analysis = img.get('analysis_result', {})
+        score = _compute_relevance_score(prompt, analysis)
+        scored.append((score, img))
+    
+    # Sort by score descending
+    scored.sort(key=lambda x: x[0], reverse=True)
+    
+    # Check if any image actually scored
+    top_score = scored[0][0] if scored else 0
+    
+    if top_score > 0:
+        # Return top N by relevance
+        selected = scored[:max_images]
+        print(f"Relevance ranking — top {len(selected)} images selected:")
+        for rank, (sc, img) in enumerate(selected, 1):
+            url = img.get('image_url', 'N/A')
+            # Show short URL for readability
+            short_url = url.split('/')[-1] if url else 'N/A'
+            print(f"  #{rank}: score={sc:.1f}  {short_url}")
+        return [img for _, img in selected]
+    else:
+        # No relevance signal — fall back to first N (arbitrary)
+        print(f"No relevance signal from prompt — using first {max_images} images as fallback")
+        return images_data[:max_images]
+
+
+def _resize_image_if_needed(pil_image: PILImage.Image, max_dim: int = MAX_IMAGE_DIMENSION) -> PILImage.Image:
+    """Resize image if either dimension exceeds max_dim, preserving aspect ratio."""
+    w, h = pil_image.size
+    if w <= max_dim and h <= max_dim:
+        return pil_image
+    
+    if w > h:
+        new_w = max_dim
+        new_h = int(h * (max_dim / w))
+    else:
+        new_h = max_dim
+        new_w = int(w * (max_dim / h))
+    
+    return pil_image.resize((new_w, new_h), PILImage.LANCZOS)
+
+
+async def _generate_with_retry(client, model: str, contents, config, max_retries: int = GEMINI_MAX_RETRIES):
+    """Call Gemini generate_content with retry logic for transient 500 errors."""
+    last_error = None
+    for attempt in range(1, max_retries + 1):
+        try:
+            response = client.models.generate_content(
+                model=model,
+                contents=contents,
+                config=config,
+            )
+            return response
+        except ServerError as e:
+            last_error = e
+            if attempt < max_retries:
+                delay = GEMINI_RETRY_BASE_DELAY ** attempt  # 2s, 4s, 8s
+                print(f"Gemini 500 error on attempt {attempt}/{max_retries}. Retrying in {delay}s... Error: {e}")
+                await asyncio.sleep(delay)
+            else:
+                print(f"Gemini 500 error on final attempt {attempt}/{max_retries}. Giving up. Error: {e}")
+    raise last_error
 
 # Configure Gemini Client
 client = None
@@ -127,12 +295,24 @@ async def generate_image(
                     if dataset_master_prompt:
                         dataset_context = f"Style Guidelines: {dataset_master_prompt}. "
                     
-                    # Fetch actual images from dataset to use as visual reference
-                    # Gemini supports up to 14 reference images — we use top 10 for rich visual context
-                    images_res = supabase.table("dataset_images").select("image_url, analysis_result").eq("dataset_id", effective_dataset_id).limit(10).execute()
+                    # ── STEP A: Fetch ALL images with analysis (lightweight — no downloads yet)
+                    all_images_res = supabase.table("dataset_images").select("image_url, analysis_result").eq("dataset_id", effective_dataset_id).execute()
                     
-                    if images_res.data:
-                        # Extract unique visual elements and style information from analyzed images
+                    if all_images_res.data:
+                        all_dataset_images = all_images_res.data
+                        print(f"Dataset has {len(all_dataset_images)} total images")
+                        
+                        # ── STEP B: Rank images by relevance to user's prompt
+                        # This uses the analysis_result (tags, description, key_elements, etc.)
+                        # to find the images most related to what the user wants to generate.
+                        selected_images = _select_relevant_images(
+                            prompt=request.prompt,
+                            images_data=all_dataset_images,
+                            max_images=MAX_REFERENCE_IMAGES,
+                        )
+                        
+                        # ── STEP C: Extract metadata from ALL images (for brand context),
+                        #            but only DOWNLOAD the selected relevant ones
                         all_tags = []
                         vibes = []
                         lighting_styles = []
@@ -142,53 +322,44 @@ async def generate_image(
                         themes = []
                         key_elements = []
                         
-                        for img in images_res.data:
+                        # Gather brand-level context from ALL analyzed images in the dataset
+                        for img in all_dataset_images:
                             if img.get('analysis_result'):
                                 analysis = img['analysis_result']
-                                
-                                # Extract specific visual elements from tags (these are the unique tangible elements)
                                 if 'tags' in analysis and isinstance(analysis['tags'], list):
                                     all_tags.extend(analysis['tags'])
-                                
-                                # Extract description for brand reference context
                                 if 'description' in analysis:
                                     all_descriptions.append(analysis['description'])
-                                
-                                # Extract vibe, lighting, and colors for additional context
                                 if 'vibe' in analysis:
                                     vibes.append(analysis['vibe'])
                                 if 'lighting' in analysis:
                                     lighting_styles.append(analysis['lighting'])
                                 if 'colors' in analysis:
                                     colors.append(analysis['colors'])
-                                # Extract image_style and theme (new universal fields)
                                 if 'image_style' in analysis:
                                     image_styles.append(analysis['image_style'])
                                 if 'theme' in analysis:
                                     themes.append(analysis['theme'])
                                 if 'key_elements' in analysis and isinstance(analysis['key_elements'], list):
                                     key_elements.extend(analysis['key_elements'])
-                            
-                            # Download the actual image to use as visual reference
+                        
+                        # ── STEP D: Download ONLY the top relevant images (saves bandwidth + time)
+                        for img in selected_images:
                             if img.get('image_url'):
                                 try:
-                                    # Download image from Supabase storage
                                     img_response = requests.get(img['image_url'], timeout=10)
                                     if img_response.status_code == 200:
-                                        # Convert to PIL Image for Gemini
                                         pil_image = PILImage.open(io.BytesIO(img_response.content))
+                                        pil_image = _resize_image_if_needed(pil_image)
                                         reference_images.append(pil_image)
-                                        print(f"Added reference image: {img['image_url']}")
+                                        print(f"Downloaded reference image ({pil_image.size[0]}x{pil_image.size[1]}): {img['image_url']}")
                                 except Exception as img_error:
                                     print(f"Warning: Could not load reference image {img.get('image_url')}: {img_error}")
-                                    # Continue with other images
                         
                         # Build unique visual elements list (remove duplicates, keep most common)
                         if all_tags:
-                            # Count frequency and get unique elements
                             from collections import Counter
                             tag_counts = Counter(all_tags)
-                            # Get top unique elements (sorted by frequency)
                             unique_visual_elements = [tag for tag, count in tag_counts.most_common(10)]
                             print(f"Extracted unique visual elements: {unique_visual_elements}")
                         
@@ -418,8 +589,9 @@ Generate the SCENE using the visual DNA from the references, rendered in the spe
             
         contents = [types.Content(role="user", parts=parts)]
         
-        # Generate the image
-        response = client.models.generate_content(
+        # Generate the image (with automatic retry on transient 500 errors)
+        response = await _generate_with_retry(
+            client=client,
             model='gemini-3-pro-image-preview',
             contents=contents,
             config=types.GenerateContentConfig(
@@ -428,7 +600,7 @@ Generate the SCENE using the visual DNA from the references, rendered in the spe
                     aspect_ratio=aspect_ratio,
                     image_size=resolution
                 )
-            )
+            ),
         )
         
         # 5. Extract the generated image from response
@@ -527,6 +699,22 @@ Generate the SCENE using the visual DNA from the references, rendered in the spe
     except HTTPException:
         # Re-raise HTTP exceptions
         raise
+    except ServerError as e:
+        print(f"Image generation failed after retries (Gemini server error): {e}")
+        import traceback
+        traceback.print_exc()
+        raise HTTPException(
+            status_code=503,
+            detail="Image generation temporarily unavailable. Google's AI service returned a server error after multiple retries. Please try again in a few moments."
+        )
+    except APIError as e:
+        print(f"Image generation failed (Gemini API error): {e}")
+        import traceback
+        traceback.print_exc()
+        raise HTTPException(
+            status_code=502,
+            detail=f"Image generation failed due to an AI service error: {str(e)}"
+        )
     except Exception as e:
         print(f"Image generation error: {e}")
         import traceback
