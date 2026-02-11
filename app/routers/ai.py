@@ -214,60 +214,31 @@ async def generate_image(
                             theme_counts = ThemeCounter(themes)
                             dataset_theme = theme_counts.most_common(1)[0][0]
                         
-                        # Build comprehensive dataset context with unique elements
-                        # When folder_id was explicitly provided via @-mention, add richer brand context
-                        if request.folder_id and folder_name:
-                            dataset_context = f"--- Brand Reference: {folder_name} ---\n"
-                            if dataset_master_prompt:
-                                dataset_context += f"Master Style Prompt: {dataset_master_prompt}\n"
-                            if dataset_theme:
-                                dataset_context += f"Subject Theme: {dataset_theme}\n"
-                            if dataset_image_style:
-                                dataset_context += f"Visual Style: {dataset_image_style}\n"
-                            if all_descriptions:
-                                dataset_context += "Reference Image Analysis:\n"
-                                for desc in all_descriptions[:10]:
-                                    dataset_context += f"- {desc}\n"
-                            if unique_visual_elements:
-                                dataset_context += f"Visual Style Tags: {', '.join(unique_visual_elements)}\n"
-                            if unique_key_elements:
-                                dataset_context += f"Key Elements: {', '.join(unique_key_elements)}\n"
-                            if colors:
-                                unique_colors = list(set(colors))
-                                dataset_context += f"Color Palette: {', '.join(unique_colors)}\n"
-                            if vibes:
-                                unique_vibes = list(set(vibes))
-                                dataset_context += f"Vibe: {', '.join(unique_vibes)}\n"
-                            if lighting_styles:
-                                unique_lighting = list(set(lighting_styles))
-                                dataset_context += f"Lighting: {', '.join(unique_lighting)}\n"
-                            if reference_images:
-                                dataset_context += f"{len(reference_images)} reference image(s) are attached — use their visual DNA (textures, materials, objects, palette) as inspiration.\n"
-                        else:
-                            # Original dataset_id-only behavior (no @-mention)
-                            if dataset_theme:
-                                dataset_context += f"Theme: {dataset_theme}. "
-                            if dataset_image_style:
-                                dataset_context += f"Visual Style: {dataset_image_style}. "
-                            if unique_visual_elements:
-                                dataset_context += f"UNIQUE VISUAL ELEMENTS: {', '.join(unique_visual_elements)}. "
-                            if unique_key_elements:
-                                dataset_context += f"KEY ELEMENTS: {', '.join(unique_key_elements)}. "
-                            
-                            if vibes:
-                                unique_vibes = list(set(vibes))
-                                dataset_context += f"Vibe: {', '.join(unique_vibes)}. "
-                            
-                            if lighting_styles:
-                                unique_lighting = list(set(lighting_styles))
-                                dataset_context += f"Lighting: {', '.join(unique_lighting)}. "
-                            
-                            if colors:
-                                unique_colors = list(set(colors))
-                                dataset_context += f"Colors: {', '.join(unique_colors)}. "
-                            
-                            if reference_images:
-                                dataset_context += f"{len(reference_images)} reference image(s) attached — draw visual DNA from them. "
+                        # Build dataset_context as a CONCISE tag-based summary
+                        # The actual reference images are passed as binary — no need to repeat
+                        # verbose descriptions in the text prompt. Tags + keywords are enough.
+                        
+                        dataset_context = f"Brand: {folder_name}\n" if folder_name else ""
+                        
+                        if dataset_theme:
+                            dataset_context += f"Theme: {dataset_theme}\n"
+                        if dataset_image_style:
+                            dataset_context += f"Original Visual Style: {dataset_image_style}\n"
+                        
+                        # Tags and key elements are the critical shorthand for the visual DNA
+                        if unique_visual_elements:
+                            dataset_context += f"Signature Elements: {', '.join(unique_visual_elements)}\n"
+                        if unique_key_elements:
+                            dataset_context += f"Key Design Features: {', '.join(unique_key_elements)}\n"
+                        if colors:
+                            unique_colors = list(set(colors))
+                            dataset_context += f"Color Palette: {', '.join(unique_colors)}\n"
+                        if vibes:
+                            unique_vibes = list(set(vibes))
+                            dataset_context += f"Mood: {', '.join(unique_vibes)}\n"
+                        if lighting_styles:
+                            unique_lighting = list(set(lighting_styles))
+                            dataset_context += f"Lighting: {', '.join(unique_lighting)}\n"
                             
             except Exception as e:
                 print(f"Warning: Could not fetch dataset context: {e}")
@@ -347,37 +318,42 @@ async def generate_image(
         
         # Create a structured prompt with clear separation between STYLE, REFERENCE, and SCENE
         if reference_images or unique_visual_elements:
-            # === PROMPT WITH DATASET REFERENCE ===
-            # Section 1: Mandatory image style (this is the PRIMARY creative direction)
-            system_instruction = f"""=== IMAGE STYLE (MANDATORY — THIS OVERRIDES ALL OTHER STYLE CUES) ===
-Render this image as: {effective_image_style} — {style_description}.
-This is the #1 priority. The final image MUST look like a {effective_image_style} image regardless of the reference material style.
-"""
+            # === PROMPT WITH REFERENCE IMAGES ===
+            # The binary reference images attached below are the PRIMARY visual source.
+            # The text prompt is a concise instruction set — NOT a verbose image description.
             
-            # Section 2: What to generate (the user's actual request)
-            system_instruction += f"""
-=== SCENE TO GENERATE ===
-{request.prompt}
-"""
+            system_instruction = f"""You are generating a new image. Follow these instructions in strict priority order:
+
+1. IMAGE STYLE: {effective_image_style} — {style_description}.
+   The output MUST be rendered in this style. This overrides the style of the reference images.
+
+2. SCENE: {request.prompt}"""
+            
             if additional_style_notes:
-                system_instruction += f"Additional creative direction: {additional_style_notes}\n"
+                system_instruction += f"\n   Creative direction: {additional_style_notes}"
             
-            # Section 3: Brand/dataset reference (visual DNA to draw from, NOT to copy literally)
-            if dataset_context:
+            system_instruction += f"""
+
+3. REFERENCE IMAGES ({len(reference_images)} attached below):
+   These images define the VISUAL DNA of the brand. Study them carefully and extract:
+   - Textures & materials (e.g. marble, wood, rattan, fabric)
+   - Color palette and tones
+   - Recurring objects, furniture, fixtures
+   - Spatial layout and composition patterns
+   - Distinctive design details
+   You MUST incorporate these visual elements into the generated scene.
+   The reference images show the LOOK AND FEEL — apply it to the SCENE above in {effective_image_style} style."""
+            
+            if dataset_context.strip():
                 system_instruction += f"""
-=== BRAND REFERENCE (use as visual DNA — adapt to the IMAGE STYLE above) ===
-{dataset_context}"""
+
+4. BRAND TAGS (concise summary of reference image DNA):
+{dataset_context.strip()}"""
             
-            if unique_visual_elements:
-                system_instruction += f"Distinctive visual elements to incorporate where relevant: {', '.join(unique_visual_elements[:10])}\n"
-            
-            if reference_images:
-                system_instruction += f"""
-=== {len(reference_images)} REFERENCE IMAGES ATTACHED ===
-Study the attached reference images for visual DNA: textures, materials, color palette, recurring objects, and spatial composition.
-Incorporate these elements into the scene but render everything in {effective_image_style} style.
-Do NOT simply recreate the reference photos — use them as inspiration while strictly following the IMAGE STYLE and SCENE instructions above.
-"""
+            system_instruction += """
+
+IMPORTANT: The attached reference images are your primary visual source. The tags above are a text summary.
+Generate the SCENE using the visual DNA from the references, rendered in the specified IMAGE STYLE."""
             
             full_prompt = system_instruction.strip()
         else:
@@ -421,18 +397,24 @@ Do NOT simply recreate the reference photos — use them as inspiration while st
         aspect_ratio = aspect_ratio_map.get(request.aspect_ratio, "1:1")
         resolution = "2K"
         
-        # Build parts list with prompt and reference images
+        # Build parts list: text instruction FIRST, then reference images, then a final nudge
         parts = [types.Part.from_text(text=full_prompt)]
         
-        # Add reference images (if any)
-        for ref_img in reference_images:
-            # Convert PIL Image to bytes
-            img_byte_arr = io.BytesIO()
-            ref_img.save(img_byte_arr, format='PNG')
-            img_byte_arr.seek(0)
-            img_bytes = img_byte_arr.read()
+        # Add reference images as binary (these are the PRIMARY visual source)
+        if reference_images:
+            parts.append(types.Part.from_text(text=f"--- REFERENCE IMAGES ({len(reference_images)}) — study these for visual DNA ---"))
+            for i, ref_img in enumerate(reference_images):
+                # Convert PIL Image to bytes
+                img_byte_arr = io.BytesIO()
+                ref_img.save(img_byte_arr, format='PNG')
+                img_byte_arr.seek(0)
+                img_bytes = img_byte_arr.read()
+                parts.append(types.Part.from_bytes(data=img_bytes, mime_type="image/png"))
             
-            parts.append(types.Part.from_bytes(data=img_bytes, mime_type="image/png"))
+            # Final instruction after all images — reminds the model what to do
+            parts.append(types.Part.from_text(
+                text=f"Now generate the scene described above. Use the visual DNA from these {len(reference_images)} reference images (textures, materials, colors, objects, layout) but render the output in {effective_image_style} style."
+            ))
             
         contents = [types.Content(role="user", parts=parts)]
         
