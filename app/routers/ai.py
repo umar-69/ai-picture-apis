@@ -114,6 +114,8 @@ async def generate_image(
         reference_images = []
         unique_visual_elements = []
         folder_name = ""
+        dataset_image_style = ""
+        dataset_theme = ""
         
         if effective_dataset_id:
             try:
@@ -126,8 +128,8 @@ async def generate_image(
                         dataset_context = f"Style Guidelines: {dataset_master_prompt}. "
                     
                     # Fetch actual images from dataset to use as visual reference
-                    # Nano Banana supports up to 14 reference images (up to 6 objects, up to 5 people)
-                    images_res = supabase.table("dataset_images").select("image_url, analysis_result").eq("dataset_id", effective_dataset_id).limit(5).execute()
+                    # Gemini supports up to 14 reference images — we use top 10 for rich visual context
+                    images_res = supabase.table("dataset_images").select("image_url, analysis_result").eq("dataset_id", effective_dataset_id).limit(10).execute()
                     
                     if images_res.data:
                         # Extract unique visual elements and style information from analyzed images
@@ -136,6 +138,9 @@ async def generate_image(
                         lighting_styles = []
                         colors = []
                         all_descriptions = []
+                        image_styles = []
+                        themes = []
+                        key_elements = []
                         
                         for img in images_res.data:
                             if img.get('analysis_result'):
@@ -156,6 +161,13 @@ async def generate_image(
                                     lighting_styles.append(analysis['lighting'])
                                 if 'colors' in analysis:
                                     colors.append(analysis['colors'])
+                                # Extract image_style and theme (new universal fields)
+                                if 'image_style' in analysis:
+                                    image_styles.append(analysis['image_style'])
+                                if 'theme' in analysis:
+                                    themes.append(analysis['theme'])
+                                if 'key_elements' in analysis and isinstance(analysis['key_elements'], list):
+                                    key_elements.extend(analysis['key_elements'])
                             
                             # Download the actual image to use as visual reference
                             if img.get('image_url'):
@@ -180,18 +192,46 @@ async def generate_image(
                             unique_visual_elements = [tag for tag, count in tag_counts.most_common(10)]
                             print(f"Extracted unique visual elements: {unique_visual_elements}")
                         
+                        # Build unique key_elements list (remove duplicates)
+                        if key_elements:
+                            from collections import Counter as KeyCounter
+                            ke_counts = KeyCounter(key_elements)
+                            unique_key_elements = [el for el, _ in ke_counts.most_common(8)]
+                        else:
+                            unique_key_elements = []
+                        
+                        # Determine dominant image_style from dataset
+                        dataset_image_style = ""
+                        if image_styles:
+                            from collections import Counter as StyleCounter
+                            style_counts = StyleCounter(image_styles)
+                            dataset_image_style = style_counts.most_common(1)[0][0]
+                        
+                        # Determine dominant theme from dataset
+                        dataset_theme = ""
+                        if themes:
+                            from collections import Counter as ThemeCounter
+                            theme_counts = ThemeCounter(themes)
+                            dataset_theme = theme_counts.most_common(1)[0][0]
+                        
                         # Build comprehensive dataset context with unique elements
                         # When folder_id was explicitly provided via @-mention, add richer brand context
                         if request.folder_id and folder_name:
                             dataset_context = f"--- Brand Reference: {folder_name} ---\n"
                             if dataset_master_prompt:
                                 dataset_context += f"Master Style Prompt: {dataset_master_prompt}\n"
+                            if dataset_theme:
+                                dataset_context += f"Subject Theme: {dataset_theme}\n"
+                            if dataset_image_style:
+                                dataset_context += f"Visual Style: {dataset_image_style}\n"
                             if all_descriptions:
                                 dataset_context += "Reference Image Analysis:\n"
-                                for desc in all_descriptions[:5]:
+                                for desc in all_descriptions[:10]:
                                     dataset_context += f"- {desc}\n"
                             if unique_visual_elements:
                                 dataset_context += f"Visual Style Tags: {', '.join(unique_visual_elements)}\n"
+                            if unique_key_elements:
+                                dataset_context += f"Key Elements: {', '.join(unique_key_elements)}\n"
                             if colors:
                                 unique_colors = list(set(colors))
                                 dataset_context += f"Color Palette: {', '.join(unique_colors)}\n"
@@ -202,11 +242,17 @@ async def generate_image(
                                 unique_lighting = list(set(lighting_styles))
                                 dataset_context += f"Lighting: {', '.join(unique_lighting)}\n"
                             if reference_images:
-                                dataset_context += f"Strictly replicate the interior design, textures, materials, and layout seen in the {len(reference_images)} reference image(s).\n"
+                                dataset_context += f"{len(reference_images)} reference image(s) are attached — use their visual DNA (textures, materials, objects, palette) as inspiration.\n"
                         else:
                             # Original dataset_id-only behavior (no @-mention)
+                            if dataset_theme:
+                                dataset_context += f"Theme: {dataset_theme}. "
+                            if dataset_image_style:
+                                dataset_context += f"Visual Style: {dataset_image_style}. "
                             if unique_visual_elements:
                                 dataset_context += f"UNIQUE VISUAL ELEMENTS: {', '.join(unique_visual_elements)}. "
+                            if unique_key_elements:
+                                dataset_context += f"KEY ELEMENTS: {', '.join(unique_key_elements)}. "
                             
                             if vibes:
                                 unique_vibes = list(set(vibes))
@@ -221,7 +267,7 @@ async def generate_image(
                                 dataset_context += f"Colors: {', '.join(unique_colors)}. "
                             
                             if reference_images:
-                                dataset_context += f"Strictly replicate the interior design, textures, materials, and layout seen in the {len(reference_images)} reference image(s). "
+                                dataset_context += f"{len(reference_images)} reference image(s) attached — draw visual DNA from them. "
                             
             except Exception as e:
                 print(f"Warning: Could not fetch dataset context: {e}")
@@ -249,31 +295,105 @@ async def generate_image(
                 # Continue anyway - environment context is optional
 
         # 3. Build the full prompt with system instruction format
-        # Create a structured prompt that emphasizes unique visual elements from the dataset
-        if reference_images and unique_visual_elements:
-            # Build system instruction with unique visual elements
-            system_instruction = f"""TASK: Generate a photorealistic professional marketing image for this specific brand location.
-STYLE: Strictly replicate the interior design, textures, lighting, and layout seen in the provided reference images.
-UNIQUE ELEMENTS TO INCLUDE: {', '.join(unique_visual_elements[:8])}
-{dataset_context}
-SCENE: {request.prompt}"""
+        
+        # Map image_style values to rich descriptive generation instructions
+        IMAGE_STYLE_DESCRIPTIONS = {
+            "photorealistic": "photorealistic, true-to-life, high-resolution photograph with natural detail",
+            "cinematic": "cinematic film-quality image with dramatic lighting, shallow depth of field, anamorphic lens flare, and movie-like color grading",
+            "illustration": "hand-drawn illustration style with clean lines and artistic detail",
+            "graphic_design": "clean graphic design with bold shapes, typography-friendly composition, and flat or semi-flat aesthetics",
+            "3d_render": "high-quality 3D rendered image with realistic materials, lighting, and depth",
+            "watercolor": "soft watercolor painting style with fluid brush strokes and translucent color washes",
+            "oil_painting": "rich oil painting style with visible brush texture, deep colors, and classical composition",
+            "sketch": "detailed pencil or pen sketch with hand-drawn linework and shading",
+            "pixel_art": "retro pixel art style with clean pixels and limited color palette",
+            "anime": "Japanese anime/manga art style with characteristic stylized features and vivid colors",
+            "vintage_film": "vintage analog film photograph with grain, muted colors, and nostalgic warmth",
+            "documentary": "documentary-style candid photograph with authentic natural lighting and real-world feel",
+            "editorial": "high-end editorial photography with polished styling, dramatic poses, and magazine-quality finish",
+            "studio_product": "professional studio product photography with clean background, controlled lighting, and sharp detail",
+            "aerial": "aerial or drone-perspective photography with sweeping top-down or elevated viewpoint",
+            "macro": "extreme close-up macro photography revealing fine textures and microscopic details",
+            "minimalist": "minimalist composition with clean negative space, simple forms, and restrained color palette",
+            "surreal": "surrealist art style with dreamlike impossible scenes and imaginative distortions",
+            "pop_art": "bold pop art style with bright colors, graphic patterns, and high contrast",
+        }
+        KNOWN_STYLES = set(IMAGE_STYLE_DESCRIPTIONS.keys())
+        
+        # Determine the image_style to use:
+        #   Priority: 1) request.image_style (explicit), 2) detect from request.style (fallback),
+        #             3) dataset dominant style, 4) default "photorealistic"
+        effective_image_style = request.image_style
+        additional_style_notes = request.style  # free-form style text for extra notes
+        
+        # Fallback: if image_style not set, check if request.style contains a known style name
+        # This handles frontends that send "cinematic" via the style field instead of image_style
+        if not effective_image_style and request.style:
+            style_lower = request.style.strip().lower().replace(" ", "_").replace("-", "_")
+            if style_lower in KNOWN_STYLES:
+                effective_image_style = style_lower
+                additional_style_notes = None  # consumed into image_style, don't duplicate
+        
+        # Fallback: use dataset's dominant analyzed style
+        if not effective_image_style and dataset_image_style:
+            effective_image_style = dataset_image_style
+        
+        # Final fallback
+        if not effective_image_style:
+            effective_image_style = "photorealistic"
+        
+        style_description = IMAGE_STYLE_DESCRIPTIONS.get(effective_image_style, f"{effective_image_style} style")
+        print(f"Resolved image_style: {effective_image_style} (from request.image_style={request.image_style}, request.style={request.style}, dataset={dataset_image_style})")
+        
+        # Create a structured prompt with clear separation between STYLE, REFERENCE, and SCENE
+        if reference_images or unique_visual_elements:
+            # === PROMPT WITH DATASET REFERENCE ===
+            # Section 1: Mandatory image style (this is the PRIMARY creative direction)
+            system_instruction = f"""=== IMAGE STYLE (MANDATORY — THIS OVERRIDES ALL OTHER STYLE CUES) ===
+Render this image as: {effective_image_style} — {style_description}.
+This is the #1 priority. The final image MUST look like a {effective_image_style} image regardless of the reference material style.
+"""
             
-            if request.style:
-                system_instruction += f"\nADDITIONAL STYLE: {request.style}"
+            # Section 2: What to generate (the user's actual request)
+            system_instruction += f"""
+=== SCENE TO GENERATE ===
+{request.prompt}
+"""
+            if additional_style_notes:
+                system_instruction += f"Additional creative direction: {additional_style_notes}\n"
             
-            full_prompt = system_instruction
+            # Section 3: Brand/dataset reference (visual DNA to draw from, NOT to copy literally)
+            if dataset_context:
+                system_instruction += f"""
+=== BRAND REFERENCE (use as visual DNA — adapt to the IMAGE STYLE above) ===
+{dataset_context}"""
+            
+            if unique_visual_elements:
+                system_instruction += f"Distinctive visual elements to incorporate where relevant: {', '.join(unique_visual_elements[:10])}\n"
+            
+            if reference_images:
+                system_instruction += f"""
+=== {len(reference_images)} REFERENCE IMAGES ATTACHED ===
+Study the attached reference images for visual DNA: textures, materials, color palette, recurring objects, and spatial composition.
+Incorporate these elements into the scene but render everything in {effective_image_style} style.
+Do NOT simply recreate the reference photos — use them as inspiration while strictly following the IMAGE STYLE and SCENE instructions above.
+"""
+            
+            full_prompt = system_instruction.strip()
         else:
-            # Fallback to simpler prompt if no dataset
+            # === PROMPT WITHOUT DATASET (simple generation) ===
             style_suffix = ""
-            if request.style:
-                style_suffix = f" Style: {request.style}."
+            if additional_style_notes:
+                style_suffix = f" Creative direction: {additional_style_notes}."
+            
+            image_style_prefix = f"Generate a {style_description} image."
             
             # Include environment_context when available (broad brand context without specific folder)
             all_context = f"{business_context}{environment_context}{dataset_context}".strip()
             if all_context:
-                full_prompt = f"{all_context}\n\n{request.prompt}{style_suffix}".strip()
+                full_prompt = f"{image_style_prefix}\n{all_context}\n\n{request.prompt}{style_suffix}".strip()
             else:
-                full_prompt = f"{request.prompt}{style_suffix}".strip()
+                full_prompt = f"{image_style_prefix}\n{request.prompt}{style_suffix}".strip()
         
         print(f"Generating image with Nano Banana Pro (Gemini 3). Prompt: {full_prompt}")
         if reference_images:
@@ -375,6 +495,7 @@ SCENE: {request.prompt}"""
                 "dataset_id": effective_dataset_id,
                 "environment_id": request.environment_id,
                 "style": request.style,
+                "image_style": effective_image_style,
                 "aspect_ratio": request.aspect_ratio,
                 "quality": request.quality,
                 "format": request.format,
@@ -412,6 +533,7 @@ SCENE: {request.prompt}"""
             "environment_id": request.environment_id,
             "folder_id": request.folder_id,
             "style": request.style,
+            "image_style": effective_image_style,
             "aspect_ratio": request.aspect_ratio,
             "quality": request.quality,
             "format": request.format,
@@ -568,19 +690,20 @@ async def analyze_dataset_images(
                     # Use gemini-3-flash-preview for state-of-the-art vision analysis with code execution
                     # We enable code_execution to allow the model to run code for better reasoning (Agentic Vision)
                     
-                    prompt = """
-                    Analyze this image and provide a JSON output with the following keys:
-                    - "description": A detailed description of the image content and style.
-                    - "tags": A list of 5-10 keywords describing the style, subject, and vibe.
-                    - "lighting": Description of the lighting (e.g., natural, studio, dark, bright).
-                    - "colors": Dominant colors or color palette.
-                    - "vibe": The overall mood or atmosphere.
-                    
-                    You can use code execution to inspect the image details if needed (e.g. counting objects, checking pixel distributions), 
-                    but the final output must be the JSON structure above.
-                    
-                    Ensure the output is valid JSON. Do not include markdown formatting like ```json.
-                    """
+                    prompt = """You are a universal image analysis engine. Analyze this image regardless of its subject matter — it could be architecture, food, fashion, nature, products, people, art, vehicles, technology, or anything else.
+
+Extract the following and return as JSON:
+
+- "description": A rich, detailed description of what the image contains — the subject, composition, setting, notable objects, textures, materials, and any distinctive visual characteristics. Be specific and thorough.
+- "tags": A list of 8-12 specific, descriptive keywords covering: the primary subject, secondary elements, materials/textures, style characteristics, and any unique or distinguishing features. Use concrete nouns and adjectives (e.g., 'Exposed Brick Wall', 'Shallow Depth of Field', 'Velvet Fabric', 'Golden Hour Light', 'Minimalist Layout').
+- "lighting": Specific lighting description — type (natural, artificial, studio, ambient, neon, mixed), direction (front-lit, back-lit, side-lit, overhead), quality (soft, harsh, diffused, dramatic), and color temperature (warm, cool, neutral).
+- "colors": The dominant color palette as a list of 3-6 specific colors or tones (e.g., 'warm amber', 'matte black', 'dusty rose', 'forest green').
+- "vibe": The overall mood, atmosphere, or emotional tone (e.g., 'cozy and intimate', 'clean and professional', 'gritty urban', 'dreamy and ethereal').
+- "theme": The broad category or subject theme of the image (e.g., 'interior design', 'food photography', 'street fashion', 'landscape', 'product shot', 'portrait', 'architecture', 'abstract art').
+- "image_style": Classify the visual/production style of the image into ONE of these categories: 'photorealistic', 'cinematic', 'illustration', 'graphic_design', '3d_render', 'watercolor', 'oil_painting', 'sketch', 'pixel_art', 'anime', 'vintage_film', 'documentary', 'editorial', 'studio_product', 'aerial', 'macro', 'minimalist', 'surreal', 'pop_art', or 'other'. Pick the single best match.
+- "key_elements": A list of 3-5 of the most visually significant and unique elements that define this specific image — the things that make it distinctive and would need to be replicated to recreate a similar image.
+
+Output valid JSON only. No markdown formatting."""
                     
                     parts = [
                         types.Part.from_text(text=prompt),
@@ -683,15 +806,20 @@ async def analyze_dataset_images_fast(
     # Reuse HTTP client for better performance
     http_client = httpx.AsyncClient(timeout=30.0, limits=httpx.Limits(max_connections=50))
     
-    # Optimized prompt focused on unique visual elements
-    prompt = """Analyze this image and identify unique, specific visual design elements, materials, or lighting features. Return JSON with:
-- "tags": Exactly 5 specific visual elements (e.g., 'Marble Countertop', 'Warm Neon', 'Industrial Pipes', 'Exposed Brick', 'Edison Bulbs')
-- "description": Brief description highlighting unique design features
-- "lighting": Specific lighting type and characteristics
-- "colors": Dominant colors or materials
-- "vibe": Overall mood and atmosphere
+    # Universal analysis prompt — works on any image type (not domain-specific)
+    prompt = """You are a universal image analysis engine. Analyze this image regardless of subject matter — architecture, food, fashion, nature, products, people, art, vehicles, technology, or anything else.
 
-Focus on distinctive, tangible elements that define the space or subject. Output valid JSON only."""
+Return JSON with:
+- "tags": 8-12 specific, descriptive keywords covering the subject, materials/textures, style, and unique features. Use concrete terms (e.g., 'Exposed Brick', 'Shallow Depth of Field', 'Velvet Fabric', 'Golden Hour Light').
+- "description": Detailed description of content, composition, setting, notable objects, textures, and distinctive visual characteristics.
+- "lighting": Specific lighting — type (natural/artificial/studio/neon/mixed), direction, quality (soft/harsh/dramatic), and color temperature (warm/cool/neutral).
+- "colors": 3-6 dominant specific colors or tones (e.g., 'warm amber', 'matte black', 'dusty rose').
+- "vibe": Overall mood or emotional tone (e.g., 'cozy and intimate', 'clean and professional', 'gritty urban').
+- "theme": Broad subject category (e.g., 'interior design', 'food photography', 'street fashion', 'portrait', 'product shot', 'landscape').
+- "image_style": ONE of: 'photorealistic', 'cinematic', 'illustration', 'graphic_design', '3d_render', 'watercolor', 'oil_painting', 'sketch', 'pixel_art', 'anime', 'vintage_film', 'documentary', 'editorial', 'studio_product', 'aerial', 'macro', 'minimalist', 'surreal', 'pop_art', or 'other'.
+- "key_elements": 3-5 most visually significant and unique elements that define this image.
+
+Output valid JSON only."""
 
     async def process_single_image(image_url):
         try:

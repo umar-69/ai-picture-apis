@@ -50,6 +50,7 @@ class DatasetResponse(DatasetBase):
 class GenerateImageRequest(BaseModel):
     prompt: str
     style: Optional[str] = None
+    image_style: Optional[str] = None  # Visual production style: photorealistic, cinematic, illustration, etc.
     aspect_ratio: Optional[str] = "1:1"
     quality: Optional[str] = "standard"
     format: Optional[str] = "png"
