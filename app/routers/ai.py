@@ -24,124 +24,154 @@ GEMINI_MAX_RETRIES = 3            # Retry transient 500 errors up to 3 times
 GEMINI_RETRY_BASE_DELAY = 2      # Base delay in seconds (exponential backoff)
 
 
-def _compute_relevance_score(prompt: str, analysis: dict) -> float:
+def _build_image_search_text(analysis: dict) -> str:
     """
-    Score how relevant a dataset image is to the user's prompt.
+    Build a rich text representation of an image's analysis for embedding.
     
-    Compares prompt words against the image's analyzed fields:
-      - tags (weight: 3x)        — most specific visual descriptors
-      - key_elements (weight: 3x) — specific design features
-      - description (weight: 2x)  — rich scene description
-      - vibe/theme (weight: 1.5x) — mood/theme match
-      - colors (weight: 1x)       — color mentions
-      - lighting (weight: 0.5x)   — lighting style
-    
-    Returns a float score (higher = more relevant).
+    Combines all analyzed fields into a single string that captures the
+    full visual identity of the image — tags, description, key elements,
+    theme, style, vibe, colors, and lighting. This text is what gets
+    embedded and compared against the user's prompt.
     """
     if not analysis:
-        return 0.0
+        return ""
     
-    # Normalize prompt: lowercase, split into meaningful words (3+ chars)
-    prompt_lower = prompt.lower()
-    prompt_words = set(w for w in prompt_lower.split() if len(w) >= 3)
+    parts = []
     
-    # Also create bigrams from prompt for multi-word matching (e.g. "latte art")
-    prompt_word_list = [w for w in prompt_lower.split() if len(w) >= 2]
-    prompt_bigrams = set()
-    for i in range(len(prompt_word_list) - 1):
-        prompt_bigrams.add(f"{prompt_word_list[i]} {prompt_word_list[i+1]}")
-    
-    score = 0.0
-    
-    # Helper: count how many prompt words appear in a text
-    def _word_matches(text: str) -> int:
-        if not text:
-            return 0
-        text_lower = text.lower()
-        matches = sum(1 for w in prompt_words if w in text_lower)
-        # Bonus for bigram matches (more specific)
-        matches += sum(2 for bg in prompt_bigrams if bg in text_lower)
-        return matches
-    
-    # Tags: highest signal — these are concise visual descriptors
+    # Tags — most specific visual identifiers (listed first for emphasis)
     tags = analysis.get('tags', [])
-    if isinstance(tags, list):
-        for tag in tags:
-            tag_lower = tag.lower()
-            # Exact tag match in prompt = strong signal
-            if tag_lower in prompt_lower:
-                score += 5.0
-            else:
-                # Partial word overlap
-                score += _word_matches(tag) * 3.0
+    if isinstance(tags, list) and tags:
+        parts.append(f"Tags: {', '.join(tags)}")
     
-    # Key elements: specific design features, equally high signal
+    # Key elements — specific design features
     key_elements = analysis.get('key_elements', [])
-    if isinstance(key_elements, list):
-        for elem in key_elements:
-            elem_lower = elem.lower()
-            if elem_lower in prompt_lower:
-                score += 5.0
-            else:
-                score += _word_matches(elem) * 3.0
+    if isinstance(key_elements, list) and key_elements:
+        parts.append(f"Key elements: {', '.join(key_elements)}")
     
-    # Description: rich context, good for matching scene-level concepts
-    description = analysis.get('description', '')
-    score += _word_matches(description) * 2.0
-    
-    # Vibe and theme: mood-level matching
-    vibe = analysis.get('vibe', '')
-    score += _word_matches(vibe) * 1.5
-    
+    # Theme and style
     theme = analysis.get('theme', '')
-    score += _word_matches(theme) * 1.5
+    if theme:
+        parts.append(f"Theme: {theme}")
     
-    # Colors: useful when prompt mentions specific colors
+    image_style = analysis.get('image_style', '')
+    if image_style:
+        parts.append(f"Style: {image_style}")
+    
+    # Vibe / mood
+    vibe = analysis.get('vibe', '')
+    if vibe:
+        parts.append(f"Mood: {vibe}")
+    
+    # Colors
     colors = analysis.get('colors', '')
     if isinstance(colors, list):
         colors = ', '.join(colors)
-    score += _word_matches(colors) * 1.0
+    if colors:
+        parts.append(f"Colors: {colors}")
     
-    # Lighting: minor signal
+    # Lighting
     lighting = analysis.get('lighting', '')
-    score += _word_matches(lighting) * 0.5
+    if lighting:
+        parts.append(f"Lighting: {lighting}")
     
-    return score
+    # Description — rich scene context (last, as it's the longest)
+    description = analysis.get('description', '')
+    if description:
+        parts.append(f"Description: {description}")
+    
+    return ". ".join(parts)
 
 
-def _select_relevant_images(prompt: str, images_data: list, max_images: int = MAX_REFERENCE_IMAGES) -> list:
+def _cosine_similarity(vec_a: list, vec_b: list) -> float:
+    """Compute cosine similarity between two vectors. Returns -1 to 1."""
+    dot = sum(a * b for a, b in zip(vec_a, vec_b))
+    mag_a = sum(a * a for a in vec_a) ** 0.5
+    mag_b = sum(b * b for b in vec_b) ** 0.5
+    if mag_a == 0 or mag_b == 0:
+        return 0.0
+    return dot / (mag_a * mag_b)
+
+
+def _find_relevant_images_semantic(
+    gemini_client,
+    prompt: str,
+    images_data: list,
+    max_images: int = MAX_REFERENCE_IMAGES,
+) -> list:
     """
-    Rank all dataset images by relevance to the prompt,
-    return the top max_images entries (with their analysis_result intact).
+    Use Gemini Embedding API to find the most semantically relevant
+    dataset images for the user's prompt.
     
-    If no image scores above 0 (i.e. prompt has no overlap with any analysis),
-    falls back to returning the first max_images images (original behavior).
+    How it works:
+      1. Build a search text for each image from its analysis_result
+         (tags, description, key_elements, theme, style, vibe, colors, lighting).
+      2. Send ONE batch embed_content call with [prompt, img1_text, img2_text, ...]
+         to Gemini's embedding model.
+      3. Compute cosine similarity between the prompt embedding and each image embedding.
+      4. Return the top N images ranked by similarity.
+    
+    Falls back to returning the first N images if embedding fails.
     """
-    scored = []
+    # Build search text for each image
+    image_texts = []
+    valid_images = []  # track which images have usable analysis text
+    
     for img in images_data:
         analysis = img.get('analysis_result', {})
-        score = _compute_relevance_score(prompt, analysis)
-        scored.append((score, img))
+        search_text = _build_image_search_text(analysis)
+        if search_text:
+            image_texts.append(search_text)
+            valid_images.append(img)
     
-    # Sort by score descending
-    scored.sort(key=lambda x: x[0], reverse=True)
+    if not valid_images:
+        print("No analyzed images found — using first images as fallback")
+        return images_data[:max_images]
     
-    # Check if any image actually scored
-    top_score = scored[0][0] if scored else 0
-    
-    if top_score > 0:
-        # Return top N by relevance
+    try:
+        # ONE API call: embed the prompt + all image texts together
+        # First item = prompt, rest = image analysis texts
+        all_texts = [prompt] + image_texts
+        
+        print(f"Embedding {len(all_texts)} texts (1 prompt + {len(image_texts)} images) via Gemini...")
+        
+        embed_result = gemini_client.models.embed_content(
+            model="gemini-embedding-001",
+            contents=all_texts,
+            config=types.EmbedContentConfig(
+                task_type="SEMANTIC_SIMILARITY",
+            ),
+        )
+        
+        # Extract embeddings: first one is the prompt, rest are images
+        prompt_embedding = embed_result.embeddings[0].values
+        image_embeddings = embed_result.embeddings[1:]
+        
+        # Score each image by cosine similarity to the prompt
+        scored = []
+        for i, img_embedding in enumerate(image_embeddings):
+            similarity = _cosine_similarity(prompt_embedding, img_embedding.values)
+            scored.append((similarity, valid_images[i]))
+        
+        # Sort by similarity descending
+        scored.sort(key=lambda x: x[0], reverse=True)
+        
+        # Select top N
         selected = scored[:max_images]
-        print(f"Relevance ranking — top {len(selected)} images selected:")
-        for rank, (sc, img) in enumerate(selected, 1):
+        
+        print(f"Semantic relevance ranking — top {len(selected)} of {len(valid_images)} images:")
+        for rank, (sim, img) in enumerate(selected, 1):
             url = img.get('image_url', 'N/A')
-            # Show short URL for readability
             short_url = url.split('/')[-1] if url else 'N/A'
-            print(f"  #{rank}: score={sc:.1f}  {short_url}")
+            # Show a few top tags for context
+            tags = img.get('analysis_result', {}).get('tags', [])
+            top_tags = ', '.join(tags[:4]) if tags else 'no tags'
+            print(f"  #{rank}: similarity={sim:.4f}  [{top_tags}]  {short_url}")
+        
         return [img for _, img in selected]
-    else:
-        # No relevance signal — fall back to first N (arbitrary)
-        print(f"No relevance signal from prompt — using first {max_images} images as fallback")
+        
+    except Exception as e:
+        # If embedding fails (API error, quota, etc.), fall back to first N
+        print(f"Warning: Semantic search failed ({e}), falling back to first {max_images} images")
         return images_data[:max_images]
 
 
@@ -302,10 +332,14 @@ async def generate_image(
                         all_dataset_images = all_images_res.data
                         print(f"Dataset has {len(all_dataset_images)} total images")
                         
-                        # ── STEP B: Rank images by relevance to user's prompt
-                        # This uses the analysis_result (tags, description, key_elements, etc.)
-                        # to find the images most related to what the user wants to generate.
-                        selected_images = _select_relevant_images(
+                        # ── STEP B: Semantic relevance search via Gemini Embedding API
+                        # Embeds the user's prompt + every image's analysis text in one
+                        # batch API call, then ranks images by cosine similarity.
+                        # This finds images that are conceptually related to the prompt,
+                        # even when exact keywords don't match (e.g. "model holding
+                        # perfume" matches images tagged "fashion", "product", "luxury").
+                        selected_images = _find_relevant_images_semantic(
+                            gemini_client=client,
                             prompt=request.prompt,
                             images_data=all_dataset_images,
                             max_images=MAX_REFERENCE_IMAGES,
