@@ -10,6 +10,7 @@ import requests
 import io
 import time
 import asyncio
+import tempfile
 from PIL import Image as PILImage
 from app.schemas import GenerateImageRequest, AnalyzeImageRequest, AnalyzeDatasetRequest, UpdateDatasetTrainingStatusRequest
 from app.dependencies import get_current_user, get_current_user_optional, get_supabase, get_supabase_admin
@@ -189,6 +190,19 @@ def _resize_image_if_needed(pil_image: PILImage.Image, max_dim: int = MAX_IMAGE_
         new_w = int(w * (max_dim / h))
     
     return pil_image.resize((new_w, new_h), PILImage.LANCZOS)
+
+
+def _ensure_rgb_image(pil_image: PILImage.Image) -> PILImage.Image:
+    """
+    Ensure image is in RGB mode for Gemini API compatibility.
+    Some JPEGs/PNGs have RGBA, P (palette), or LA mode which can cause
+    400 INVALID_ARGUMENT when sent to generate_content.
+    """
+    if pil_image.mode == "RGB":
+        return pil_image
+    if pil_image.mode in ("RGBA", "LA", "P"):
+        return pil_image.convert("RGB")
+    return pil_image.convert("RGB")
 
 
 async def _generate_with_retry(client, model: str, contents, config, max_retries: int = GEMINI_MAX_RETRIES):
@@ -602,40 +616,109 @@ Generate the SCENE using the visual DNA from the references, rendered in the spe
         aspect_ratio = aspect_ratio_map.get(request.aspect_ratio, "1:1")
         resolution = "2K"
         
-        # Build parts list: text instruction FIRST, then reference images, then a final nudge
-        parts = [types.Part.from_text(text=full_prompt)]
+        # Build parts and generate. If 400 INVALID_ARGUMENT (payload too large / invalid),
+        # retry once with fewer reference images (3 instead of 5).
+        images_to_send = reference_images
+        response = None
         
-        # Add reference images as binary (these are the PRIMARY visual source)
-        if reference_images:
-            parts.append(types.Part.from_text(text=f"--- REFERENCE IMAGES ({len(reference_images)}) — study these for visual DNA ---"))
-            for i, ref_img in enumerate(reference_images):
-                # Convert PIL Image to bytes
-                img_byte_arr = io.BytesIO()
-                ref_img.save(img_byte_arr, format='PNG')
-                img_byte_arr.seek(0)
-                img_bytes = img_byte_arr.read()
-                parts.append(types.Part.from_bytes(data=img_bytes, mime_type="image/png"))
+        for attempt in range(2):
+            # Build parts list: text instruction FIRST, then reference images, then a final nudge
+            parts = [types.Part.from_text(text=full_prompt)]
             
-            # Final instruction after all images — reminds the model what to do
-            parts.append(types.Part.from_text(
-                text=f"Now generate the scene described above. Use the visual DNA from these {len(reference_images)} reference images (textures, materials, colors, objects, layout) but render the output in {effective_image_style} style."
-            ))
+            uploaded_files = []  # Track uploaded files to use their URIs
             
-        contents = [types.Content(role="user", parts=parts)]
-        
-        # Generate the image (with automatic retry on transient 500 errors)
-        response = await _generate_with_retry(
-            client=client,
-            model='gemini-3-pro-image-preview',
-            contents=contents,
-            config=types.GenerateContentConfig(
-                response_modalities=["IMAGE"],
-                image_config=types.ImageConfig(
-                    aspect_ratio=aspect_ratio,
-                    image_size=resolution
+            if images_to_send:
+                # Use File API for robust handling of multiple images (avoids 20MB payload limit)
+                # We upload the images to Gemini first, then reference them by URI.
+                try:
+                    for ref_img in images_to_send:
+                        # Ensure RGB mode
+                        ref_img = _ensure_rgb_image(ref_img)
+                        
+                        # Save to temp buffer
+                        img_byte_arr = io.BytesIO()
+                        ref_img.save(img_byte_arr, format='PNG')
+                        img_byte_arr.seek(0)
+                        
+                        # Upload to Gemini File API
+                        # We use a temporary named file to upload from memory
+                        # (The SDK client.files.upload expects a file path or file-like object)
+                        
+                        # Since SDK might strictly require a path or file-like with name, 
+                        # we'll save to a temp file on disk to be safe and robust.
+                        with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as tf:
+                            ref_img.save(tf.name, format="PNG")
+                            tf_path = tf.name
+                        
+                        try:
+                            print(f"Uploading reference image to Gemini File API...")
+                            uploaded_file = client.files.upload(path=tf_path, config=types.UploadFileConfig(mime_type="image/png"))
+                            uploaded_files.append(uploaded_file)
+                            
+                            # Add the file reference to the prompt parts
+                            parts.append(types.Part.from_uri(
+                                file_uri=uploaded_file.uri,
+                                mime_type=uploaded_file.mime_type
+                            ))
+                        finally:
+                            # Clean up local temp file
+                            if os.path.exists(tf_path):
+                                os.unlink(tf_path)
+                    
+                    # Add instruction text AFTER images as recommended in docs
+                    parts.append(types.Part.from_text(
+                        text=f"--- REFERENCE IMAGES ABOVE ({len(images_to_send)}) ---\n"
+                             f"Now generate the scene described above. Use the visual DNA from these {len(images_to_send)} reference images "
+                             f"(textures, materials, colors, objects, layout) but render the output in {effective_image_style} style."
+                    ))
+                    
+                except Exception as upload_err:
+                    print(f"File API upload failed: {upload_err}. Falling back to inline bytes.")
+                    # Fallback logic if File API fails (e.g. network issue)
+                    # Clear parts and uploaded_files, restart with inline bytes
+                    parts = [types.Part.from_text(text=full_prompt)]
+                    uploaded_files = [] # Clear any partial uploads
+                    
+                    parts.append(types.Part.from_text(text=f"--- REFERENCE IMAGES ({len(images_to_send)}) — study these for visual DNA ---"))
+                    for ref_img in images_to_send:
+                        ref_img = _ensure_rgb_image(ref_img)
+                        img_byte_arr = io.BytesIO()
+                        ref_img.save(img_byte_arr, format='PNG')
+                        img_byte_arr.seek(0)
+                        img_bytes = img_byte_arr.read()
+                        parts.append(types.Part.from_bytes(data=img_bytes, mime_type="image/png"))
+                    
+                    parts.append(types.Part.from_text(
+                         text=f"Now generate the scene described above. Use the visual DNA from these {len(images_to_send)} reference images (textures, materials, colors, objects, layout) but render the output in {effective_image_style} style."
+                    ))
+            
+            contents = [types.Content(role="user", parts=parts)]
+            
+            try:
+                response = await _generate_with_retry(
+                    client=client,
+                    model='gemini-3-pro-image-preview',
+                    contents=contents,
+                    config=types.GenerateContentConfig(
+                        response_modalities=["IMAGE"],
+                        image_config=types.ImageConfig(
+                            aspect_ratio=aspect_ratio,
+                            image_size=resolution
+                        )
+                    ),
                 )
-            ),
-        )
+                break
+            except APIError as e:
+                err_str = str(e)
+                # 400 INVALID_ARGUMENT often from payload size or image format — retry with fewer images
+                if attempt == 0 and len(images_to_send) > 3 and ("400" in err_str or "INVALID_ARGUMENT" in err_str):
+                    print(f"400 INVALID_ARGUMENT with {len(images_to_send)} images, retrying with top 3...")
+                    images_to_send = images_to_send[:3]
+                else:
+                    raise
+        
+        if response is None:
+            raise HTTPException(status_code=500, detail="Image generation failed")
         
         # 5. Extract the generated image from response
         image_bytes = None
@@ -688,7 +771,7 @@ Generate the SCENE using the visual DNA from the references, rendered in the spe
                 "quality": request.quality,
                 "format": request.format,
                 "resolution": resolution,
-                "reference_images_count": len(reference_images),
+                "reference_images_count": len(images_to_send),
                 "unique_visual_elements": unique_visual_elements if unique_visual_elements else None
             }
             
@@ -726,7 +809,7 @@ Generate the SCENE using the visual DNA from the references, rendered in the spe
             "quality": request.quality,
             "format": request.format,
             "resolution": resolution,
-            "reference_images_count": len(reference_images),
+            "reference_images_count": len(images_to_send),
             "credits_used": CREDIT_COSTS["generate_image"] if current_user else 0
         }
         
@@ -742,13 +825,19 @@ Generate the SCENE using the visual DNA from the references, rendered in the spe
             detail="Image generation temporarily unavailable. Google's AI service returned a server error after multiple retries. Please try again in a few moments."
         )
     except APIError as e:
+        err_str = str(e)
         print(f"Image generation failed (Gemini API error): {e}")
         import traceback
         traceback.print_exc()
-        raise HTTPException(
-            status_code=502,
-            detail=f"Image generation failed due to an AI service error: {str(e)}"
-        )
+        # 400 INVALID_ARGUMENT: often payload size, image format, or content policy
+        if "400" in err_str or "INVALID_ARGUMENT" in err_str:
+            detail = (
+                "Image generation failed: the AI service rejected the request (invalid argument). "
+                "Try a simpler or shorter prompt, or use a dataset with fewer reference images."
+            )
+        else:
+            detail = f"Image generation failed due to an AI service error: {err_str}"
+        raise HTTPException(status_code=502, detail=detail)
     except Exception as e:
         print(f"Image generation error: {e}")
         import traceback
