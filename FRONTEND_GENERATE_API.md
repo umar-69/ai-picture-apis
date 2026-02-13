@@ -6,7 +6,7 @@ This guide documents the updated `POST /ai/generate` endpoint for generating bra
 
 **POST** `/ai/generate`
 
-Generates a high-quality image using your brand's visual DNA. The system automatically selects the 5 most relevant reference images from the specified folder based on the user's prompt.
+Generates a high-quality image using your brand's visual DNA. The system automatically selects up to 14 most relevant reference images from the specified folder based on the user's prompt and style (using semantic ranking over analyzed image metadata).
 
 ### Authentication
 
@@ -57,7 +57,7 @@ Returns the generated image URL and metadata.
   "dataset_id": "4375cd45-c454-4936-a10b-3daea640d973",
   "folder_id": "4375cd45-c454-4936-a10b-3daea640d973",
   "image_style": "photorealistic",
-  "reference_images_count": 5,
+  "reference_images_count": 14,
   "credits_used": 5
 }
 ```

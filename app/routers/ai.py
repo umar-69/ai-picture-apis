@@ -23,6 +23,12 @@ MAX_REFERENCE_IMAGES = 14         # Gemini 3 Pro supports up to 14 reference ima
 MAX_IMAGE_DIMENSION = 1024        # Resize large images to this max width/height
 GEMINI_MAX_RETRIES = 3            # Retry transient 500 errors up to 3 times
 GEMINI_RETRY_BASE_DELAY = 2      # Base delay in seconds (exponential backoff)
+EMBED_BATCH_SIZE = 200            # Batch embeddings for large datasets
+MAX_DATASET_IMAGES_FETCH = 5000   # Safety cap when scanning large datasets
+HYBRID_CANDIDATE_MULTIPLIER = 3   # Semantic prefilter pool size before vision rerank
+VISION_RERANK_BATCH_SIZE = 8      # Images per Gemini vision rerank call
+VISION_RERANK_MAX_RETRIES = 3     # Retry vision rerank batch calls
+VISION_RERANK_RETRY_BASE_DELAY = 2  # Base delay for vision rerank retry backoff
 
 
 def _build_image_search_text(analysis: dict) -> str:
@@ -83,6 +89,43 @@ def _build_image_search_text(analysis: dict) -> str:
     return ". ".join(parts)
 
 
+def _build_relevance_query(
+    prompt: str,
+    image_style: str = "",
+    style_notes: str = "",
+    folder_name: str = "",
+    dataset_master_prompt: str = "",
+) -> str:
+    """
+    Build a focused retrieval query for semantic image ranking.
+    This follows Gemini prompt fundamentals: clear intent + explicit constraints.
+    """
+    parts = [f"User request: {prompt.strip()}"]
+    if image_style:
+        parts.append(f"Preferred visual production style: {image_style}")
+    if style_notes:
+        parts.append(f"Additional style constraints: {style_notes}")
+    if folder_name:
+        parts.append(f"Dataset context: {folder_name}")
+    if dataset_master_prompt:
+        parts.append(f"Dataset master prompt: {dataset_master_prompt}")
+    return ". ".join(parts)
+
+
+def _extract_json_text(raw_text: str) -> str:
+    """Extract JSON payload from plain/fenced model output."""
+    if not raw_text:
+        return ""
+    text = raw_text.strip()
+    if text.startswith("```json"):
+        text = text[7:]
+    if text.startswith("```"):
+        text = text[3:]
+    if text.endswith("```"):
+        text = text[:-3]
+    return text.strip()
+
+
 def _cosine_similarity(vec_a: list, vec_b: list) -> float:
     """Compute cosine similarity between two vectors. Returns -1 to 1."""
     dot = sum(a * b for a, b in zip(vec_a, vec_b))
@@ -104,63 +147,70 @@ def _find_relevant_images_semantic(
     dataset images for the user's prompt.
     
     How it works:
-      1. Build a search text for each image from its analysis_result
+      1. Build search text from image analysis_result
          (tags, description, key_elements, theme, style, vibe, colors, lighting).
-      2. Send ONE batch embed_content call with [prompt, img1_text, img2_text, ...]
-         to Gemini's embedding model.
-      3. Compute cosine similarity between the prompt embedding and each image embedding.
-      4. Return the top N images ranked by similarity.
+      2. Embed the prompt once.
+      3. Embed image texts in batches (scales to large folders).
+      4. Score each image by cosine similarity, sort descending, return top N.
     
     Falls back to returning the first N images if embedding fails.
     """
     # Build search text for each image
-    image_texts = []
-    valid_images = []  # track which images have usable analysis text
+    scorable = []      # list[(img, search_text)] for analyzed images
+    fallback_only = [] # images without usable analysis_result text
     
     for img in images_data:
         analysis = img.get('analysis_result', {})
         search_text = _build_image_search_text(analysis)
         if search_text:
-            image_texts.append(search_text)
-            valid_images.append(img)
+            scorable.append((img, search_text))
+        else:
+            fallback_only.append(img)
     
-    if not valid_images:
+    if not scorable:
         print("No analyzed images found — using first images as fallback")
         return images_data[:max_images]
     
     try:
-        # ONE API call: embed the prompt + all image texts together
-        # First item = prompt, rest = image analysis texts
-        all_texts = [prompt] + image_texts
-        
-        print(f"Embedding {len(all_texts)} texts (1 prompt + {len(image_texts)} images) via Gemini...")
-        
-        embed_result = gemini_client.models.embed_content(
+        prompt_embed = gemini_client.models.embed_content(
             model="gemini-embedding-001",
-            contents=all_texts,
+            contents=[prompt],
             config=types.EmbedContentConfig(
                 task_type="SEMANTIC_SIMILARITY",
             ),
         )
+        prompt_embedding = prompt_embed.embeddings[0].values
         
-        # Extract embeddings: first one is the prompt, rest are images
-        prompt_embedding = embed_result.embeddings[0].values
-        image_embeddings = embed_result.embeddings[1:]
-        
-        # Score each image by cosine similarity to the prompt
+        print(f"Ranking {len(scorable)} analyzed images with Gemini embeddings (batch size={EMBED_BATCH_SIZE})...")
+
+        # Score each image by cosine similarity to the prompt, in batches
         scored = []
-        for i, img_embedding in enumerate(image_embeddings):
-            similarity = _cosine_similarity(prompt_embedding, img_embedding.values)
-            scored.append((similarity, valid_images[i]))
+        for start in range(0, len(scorable), EMBED_BATCH_SIZE):
+            batch = scorable[start:start + EMBED_BATCH_SIZE]
+            batch_texts = [search_text for _, search_text in batch]
+            batch_embed = gemini_client.models.embed_content(
+                model="gemini-embedding-001",
+                contents=batch_texts,
+                config=types.EmbedContentConfig(task_type="SEMANTIC_SIMILARITY"),
+            )
+            for (img, _), img_embedding in zip(batch, batch_embed.embeddings):
+                similarity = _cosine_similarity(prompt_embedding, img_embedding.values)
+                scored.append((similarity, img))
         
         # Sort by similarity descending
         scored.sort(key=lambda x: x[0], reverse=True)
         
         # Select top N
-        selected = scored[:max_images]
+        selected_scored = scored[:max_images]
+        selected_images = [img for _, img in selected_scored]
+
+        # If we still need images, append non-analyzed images as fallback
+        if len(selected_images) < max_images and fallback_only:
+            needed = max_images - len(selected_images)
+            selected_images.extend(fallback_only[:needed])
         
-        print(f"Semantic relevance ranking — top {len(selected)} of {len(valid_images)} images:")
-        for rank, (sim, img) in enumerate(selected, 1):
+        print(f"Semantic relevance ranking — selected {len(selected_images)} of {len(images_data)} images:")
+        for rank, (sim, img) in enumerate(selected_scored, 1):
             url = img.get('image_url', 'N/A')
             short_url = url.split('/')[-1] if url else 'N/A'
             # Show a few top tags for context
@@ -168,12 +218,145 @@ def _find_relevant_images_semantic(
             top_tags = ', '.join(tags[:4]) if tags else 'no tags'
             print(f"  #{rank}: similarity={sim:.4f}  [{top_tags}]  {short_url}")
         
-        return [img for _, img in selected]
+        return selected_images
         
     except Exception as e:
         # If embedding fails (API error, quota, etc.), fall back to first N
         print(f"Warning: Semantic search failed ({e}), falling back to first {max_images} images")
         return images_data[:max_images]
+
+
+def _rerank_images_with_vision(
+    gemini_client,
+    prompt: str,
+    images_data: list,
+    max_images: int = MAX_REFERENCE_IMAGES,
+) -> list:
+    """
+    Vision rerank stage (direct image understanding).
+    Input should be semantic-prefiltered candidates.
+    """
+    if not images_data:
+        return []
+    if len(images_data) <= max_images:
+        return images_data[:max_images]
+
+    scored = []
+    scored_ids = set()
+    hard_failure = False
+
+    for start in range(0, len(images_data), VISION_RERANK_BATCH_SIZE):
+        batch = images_data[start:start + VISION_RERANK_BATCH_SIZE]
+        parts = []
+
+        instruction = (
+            "Rank candidate reference images for generation relevance.\n"
+            f"User request: {prompt}\n\n"
+            "For each candidate image, assign a relevance score from 0.0 to 1.0 where:\n"
+            "- 1.0 = highly aligned with subject/theme/style/composition/lighting\n"
+            "- 0.0 = unrelated\n\n"
+            "Return strict JSON only in this exact shape:\n"
+            "{\"scores\":[{\"candidate\":1,\"score\":0.92}]}\n"
+            "Use the candidate number shown before each image."
+        )
+        parts.append(types.Part.from_text(text=instruction))
+
+        local_idx_to_img = {}
+        local_idx = 1
+        for img in batch:
+            image_url = img.get("image_url")
+            if not image_url:
+                continue
+            try:
+                img_response = requests.get(image_url, timeout=10)
+                if img_response.status_code != 200:
+                    continue
+
+                mime_type = img_response.headers.get("content-type", "image/jpeg").split(";")[0].strip().lower()
+                if not mime_type.startswith("image/"):
+                    mime_type = "image/jpeg"
+
+                parts.append(types.Part.from_text(text=f"Candidate {local_idx}"))
+                parts.append(types.Part.from_bytes(data=img_response.content, mime_type=mime_type))
+                local_idx_to_img[local_idx] = img
+                local_idx += 1
+            except Exception as img_err:
+                print(f"Warning: Vision rerank could not load image {image_url}: {img_err}")
+
+        if not local_idx_to_img:
+            continue
+
+        response = None
+        for attempt in range(1, VISION_RERANK_MAX_RETRIES + 1):
+            try:
+                response = gemini_client.models.generate_content(
+                    model="gemini-3-flash-preview",
+                    contents=[types.Content(role="user", parts=parts)],
+                    config=types.GenerateContentConfig(
+                        response_mime_type="application/json",
+                        thinking_config=types.ThinkingConfig(thinking_level="minimal")
+                    )
+                )
+                break
+            except Exception as rerank_err:
+                if attempt < VISION_RERANK_MAX_RETRIES:
+                    delay = VISION_RERANK_RETRY_BASE_DELAY ** attempt
+                    print(
+                        f"Vision rerank batch failed on attempt {attempt}/{VISION_RERANK_MAX_RETRIES}. "
+                        f"Retrying in {delay}s... Error: {rerank_err}"
+                    )
+                    time.sleep(delay)
+                else:
+                    print(
+                        f"Vision rerank batch failed on final attempt {attempt}/{VISION_RERANK_MAX_RETRIES}. "
+                        f"Falling back to semantic order. Error: {rerank_err}"
+                    )
+                    hard_failure = True
+
+        if hard_failure:
+            break
+
+        try:
+            parsed_text = _extract_json_text(response.text if response and response.text else "")
+            parsed = json.loads(parsed_text) if parsed_text else {}
+            raw_scores = parsed.get("scores", []) if isinstance(parsed, dict) else []
+            score_map = {}
+            for row in raw_scores:
+                if not isinstance(row, dict):
+                    continue
+                try:
+                    c = int(row.get("candidate"))
+                    s = float(row.get("score"))
+                    # Clamp scores to expected range
+                    score_map[c] = max(0.0, min(1.0, s))
+                except Exception:
+                    continue
+
+            for c, img in local_idx_to_img.items():
+                vision_score = score_map.get(c, 0.0)
+                scored.append((vision_score, img))
+                scored_ids.add(id(img))
+
+        except Exception as parse_err:
+            print(f"Warning: Vision rerank response parsing failed: {parse_err}")
+            hard_failure = True
+            break
+
+    # If vision rerank couldn't complete reliably, use semantic order directly.
+    if hard_failure or not scored:
+        print("Vision rerank unavailable after retries — using semantic selection fallback")
+        return images_data[:max_images]
+
+    # Preserve semantic order as fallback for unscored images
+    for img in images_data:
+        if id(img) not in scored_ids:
+            scored.append((0.0, img))
+
+    scored.sort(key=lambda x: x[0], reverse=True)
+    selected = [img for _, img in scored[:max_images]]
+
+    print(f"Vision rerank selected {len(selected)} references from {len(images_data)} semantic candidates")
+    return selected
 
 
 def _resize_image_if_needed(pil_image: PILImage.Image, max_dim: int = MAX_IMAGE_DIMENSION) -> PILImage.Image:
@@ -308,27 +491,83 @@ async def generate_image(
         #    folder_id maps to datasets.id — when provided, it takes priority
         effective_dataset_id = request.folder_id or request.dataset_id
         
-        # 2a. Fetch Dataset/Folder reference images (up to 14, sent directly to Gemini)
-        # Following Gemini docs: simple prompt + reference images — no text-based search.
-        # https://ai.google.dev/gemini-api/docs/image-generation
+        # Resolve style early so retrieval can include it
+        effective_image_style = request.image_style or "photorealistic"
+        additional_style_notes = request.style
+
+        # 2a. Fetch dataset images and select the most relevant references (top 14)
+        # Uses Gemini embeddings over analyzed image metadata to improve consistency.
         reference_images = []
         folder_name = ""
+        dataset_master_prompt = ""
         
         if effective_dataset_id:
             try:
                 # Fetch dataset name for logging
-                dataset_res = supabase.table("datasets").select("name").eq("id", effective_dataset_id).single().execute()
+                dataset_res = (
+                    supabase
+                    .table("datasets")
+                    .select("name, master_prompt")
+                    .eq("id", effective_dataset_id)
+                    .single()
+                    .execute()
+                )
                 if dataset_res.data:
                     folder_name = dataset_res.data.get('name', '')
+                    dataset_master_prompt = dataset_res.data.get('master_prompt', '') or ''
                     
-                    # Fetch ALL image URLs from dataset (up to 14 — Gemini 3 Pro limit)
-                    all_images_res = supabase.table("dataset_images").select("image_url").eq("dataset_id", effective_dataset_id).limit(MAX_REFERENCE_IMAGES).execute()
-                    
-                    if all_images_res.data:
-                        print(f"Dataset '{folder_name}' has {len(all_images_res.data)} images (sending up to {MAX_REFERENCE_IMAGES})")
-                        
-                        # Download images directly — no semantic search, just send them all
-                        for img in all_images_res.data:
+                    # Fetch dataset images in pages to cover the full folder
+                    all_images_data = []
+                    page_size = 1000
+                    start = 0
+                    while start < MAX_DATASET_IMAGES_FETCH:
+                        end = min(start + page_size - 1, MAX_DATASET_IMAGES_FETCH - 1)
+                        page_res = (
+                            supabase
+                            .table("dataset_images")
+                            .select("image_url, analysis_result, created_at")
+                            .eq("dataset_id", effective_dataset_id)
+                            .range(start, end)
+                            .execute()
+                        )
+                        page_data = page_res.data or []
+                        if not page_data:
+                            break
+                        all_images_data.extend(page_data)
+                        if len(page_data) < page_size:
+                            break
+                        start += page_size
+
+                    if all_images_data:
+                        print(f"Dataset '{folder_name}' has {len(all_images_data)} images (selecting top {MAX_REFERENCE_IMAGES})")
+
+                        retrieval_query = _build_relevance_query(
+                            prompt=request.prompt,
+                            image_style=effective_image_style,
+                            style_notes=additional_style_notes or "",
+                            folder_name=folder_name,
+                            dataset_master_prompt=dataset_master_prompt,
+                        )
+
+                        semantic_pool_size = min(
+                            len(all_images_data),
+                            max(MAX_REFERENCE_IMAGES, MAX_REFERENCE_IMAGES * HYBRID_CANDIDATE_MULTIPLIER)
+                        )
+                        semantic_candidates = _find_relevant_images_semantic(
+                            gemini_client=client,
+                            prompt=retrieval_query,
+                            images_data=all_images_data,
+                            max_images=semantic_pool_size,
+                        )
+                        ranked_images = _rerank_images_with_vision(
+                            gemini_client=client,
+                            prompt=retrieval_query,
+                            images_data=semantic_candidates,
+                            max_images=MAX_REFERENCE_IMAGES,
+                        )
+
+                        # Download the ranked references
+                        for img in ranked_images:
                             if img.get('image_url'):
                                 try:
                                     img_response = requests.get(img['image_url'], timeout=10)
@@ -336,7 +575,7 @@ async def generate_image(
                                         pil_image = PILImage.open(io.BytesIO(img_response.content))
                                         pil_image = _resize_image_if_needed(pil_image)
                                         reference_images.append(pil_image)
-                                        print(f"Downloaded reference image ({pil_image.size[0]}x{pil_image.size[1]}): {img['image_url']}")
+                                        print(f"Selected reference image ({pil_image.size[0]}x{pil_image.size[1]}): {img['image_url']}")
                                 except Exception as img_error:
                                     print(f"Warning: Could not load reference image {img.get('image_url')}: {img_error}")
                         
@@ -350,22 +589,21 @@ async def generate_image(
         # Following Gemini docs pattern: short prompt + reference images
         # https://ai.google.dev/gemini-api/docs/image-generation
         
-        # Resolve style (used for prompt without references)
-        effective_image_style = request.image_style or "photorealistic"
-        additional_style_notes = request.style
-        
         if reference_images:
             # === PROMPT WITH REFERENCE IMAGES ===
-            # Follow Gemini "Prompts for editing images" pattern:
-            # https://ai.google.dev/gemini-api/docs/image-generation
-            # "Using the provided image(s)..." tells the model to match style, lighting, subjects.
-            # Keep it simple; the user's prompt describes the scene.
+            # Follow Gemini prompt best-practices:
+            # - clear intent
+            # - explicit constraints
+            # - output target grounded by references
             full_prompt = (
-                f"Using the provided reference images, create the following. "
-                f"Match the subjects, style, lighting, and key visual elements from these images: {request.prompt}"
+                "Using the provided reference images as visual ground truth, generate one final image. "
+                "Preserve the most important subject identity, composition language, lighting behavior, "
+                "texture/material treatment, and overall color palette from those references. "
+                f"User request: {request.prompt}. "
+                f"Target style class: {effective_image_style}."
             )
             if additional_style_notes:
-                full_prompt += f" {additional_style_notes}."
+                full_prompt += f" Additional style notes: {additional_style_notes}."
             
             print(f"Using reference-image prompt with {len(reference_images)} images")
         else:
