@@ -7,6 +7,8 @@ import uuid
 import json
 import base64
 import requests
+import re
+import difflib
 import io
 import time
 import asyncio
@@ -29,6 +31,7 @@ HYBRID_CANDIDATE_MULTIPLIER = 3   # Semantic prefilter pool size before vision r
 VISION_RERANK_BATCH_SIZE = 8      # Images per Gemini vision rerank call
 VISION_RERANK_MAX_RETRIES = 3     # Retry vision rerank batch calls
 VISION_RERANK_RETRY_BASE_DELAY = 2  # Base delay for vision rerank retry backoff
+MENTION_FUZZY_CUTOFF = 0.72       # Fuzzy threshold for mention-to-dataset matching
 
 
 def _build_image_search_text(analysis: dict) -> str:
@@ -87,6 +90,211 @@ def _build_image_search_text(analysis: dict) -> str:
         parts.append(f"Description: {description}")
     
     return ". ".join(parts)
+
+
+def _normalize_lookup_text(value: str) -> str:
+    """Normalize text for robust exact/fuzzy matching."""
+    if not value:
+        return ""
+    return " ".join(value.lower().strip().split())
+
+
+def _trim_mention_phrase(raw: str) -> str:
+    """
+    Trim noisy trailing words from @mentions captured in free-form prompts.
+    Example: "sauban standing in front of" -> "sauban"
+    """
+    if not raw:
+        return ""
+    text = raw.strip().strip("/").strip()
+    text = re.sub(r"\s+", " ", text)
+
+    stop_words = {
+        "standing", "holding", "wearing", "with", "without", "in", "on", "at",
+        "front", "of", "near", "beside", "behind", "under", "over", "and",
+        "context", "business", "theme", "vibe", "customer", "prompt",
+    }
+    tokens = text.split(" ")
+    kept = []
+    for token in tokens:
+        t = token.lower().strip()
+        if t.endswith(":"):
+            break
+        if t in stop_words:
+            break
+        kept.append(token)
+        if len(kept) >= 6:
+            break
+    return " ".join(kept).strip()
+
+
+def _extract_prompt_dataset_mentions(prompt: str) -> tuple[list[tuple[str, str]], list[str]]:
+    """
+    Extract potential dataset mentions from prompt text.
+    Supports:
+      - Path style: @Environment/Folder
+      - Folder style: @FolderName
+    """
+    if not prompt:
+        return [], []
+
+    path_mentions = []
+    plain_mentions = []
+
+    # Path mentions like @Character/sauban or @new environment/braun notes
+    path_pattern = re.compile(
+        r"@\s*([A-Za-z0-9][A-Za-z0-9 _-]{0,64})\s*/\s*([A-Za-z0-9][A-Za-z0-9 _-]{0,96})"
+    )
+    for match in path_pattern.finditer(prompt):
+        env_raw = _trim_mention_phrase(match.group(1))
+        folder_raw = _trim_mention_phrase(match.group(2))
+        if env_raw and folder_raw:
+            path_mentions.append((env_raw, folder_raw))
+
+    # Plain mentions like @sauban (skip those that are actually @env/folder)
+    plain_pattern = re.compile(r"@\s*([A-Za-z0-9][A-Za-z0-9 _-]{0,96})(?!\s*/)")
+    for match in plain_pattern.finditer(prompt):
+        mention = _trim_mention_phrase(match.group(1))
+        if not mention:
+            continue
+        mention_norm = _normalize_lookup_text(mention)
+        if mention_norm in {"business context", "business", "theme", "vibe", "customer", "n a", "na"}:
+            continue
+        plain_mentions.append(mention)
+
+    # De-duplicate while preserving order
+    seen_path = set()
+    uniq_path = []
+    for env_name, folder_name in path_mentions:
+        key = (_normalize_lookup_text(env_name), _normalize_lookup_text(folder_name))
+        if key not in seen_path:
+            seen_path.add(key)
+            uniq_path.append((env_name, folder_name))
+
+    seen_plain = set()
+    uniq_plain = []
+    for mention in plain_mentions:
+        key = _normalize_lookup_text(mention)
+        if key not in seen_plain:
+            seen_plain.add(key)
+            uniq_plain.append(mention)
+
+    return uniq_path, uniq_plain
+
+
+def _fuzzy_match_key(query: str, keys: list[str], cutoff: float = MENTION_FUZZY_CUTOFF) -> str | None:
+    """Return best fuzzy key match or None."""
+    if not query or not keys:
+        return None
+    query_norm = _normalize_lookup_text(query)
+    if query_norm in keys:
+        return query_norm
+    match = difflib.get_close_matches(query_norm, keys, n=1, cutoff=cutoff)
+    return match[0] if match else None
+
+
+def _match_dataset_by_name(query: str, datasets: list[dict]) -> dict | None:
+    """Match a folder name to the best dataset row using exact/contains/fuzzy."""
+    if not query or not datasets:
+        return None
+    query_norm = _normalize_lookup_text(query)
+
+    by_norm = {}
+    for ds in datasets:
+        ds_name_norm = _normalize_lookup_text(ds.get("name", ""))
+        if not ds_name_norm:
+            continue
+        by_norm.setdefault(ds_name_norm, []).append(ds)
+
+    if query_norm in by_norm:
+        return by_norm[query_norm][0]
+
+    for ds_name_norm, rows in by_norm.items():
+        if query_norm in ds_name_norm or ds_name_norm in query_norm:
+            return rows[0]
+
+    best_key = _fuzzy_match_key(query_norm, list(by_norm.keys()))
+    if best_key:
+        return by_norm[best_key][0]
+    return None
+
+
+def _resolve_referenced_dataset_ids(
+    supabase: Client,
+    prompt: str,
+    current_user=None,
+    explicit_dataset_ids: list[str] | None = None,
+) -> list[str]:
+    """
+    Resolve all dataset IDs referenced in prompt @mentions.
+    Combines explicit IDs (folder_id/dataset_id) + prompt references.
+    """
+    resolved_ids = []
+    for ds_id in (explicit_dataset_ids or []):
+        if ds_id and ds_id not in resolved_ids:
+            resolved_ids.append(ds_id)
+
+    if not prompt:
+        return resolved_ids
+
+    try:
+        ds_query = supabase.table("datasets").select("id, name, environment_id, user_id")
+        env_query = supabase.table("environments").select("id, name, user_id")
+        if current_user:
+            user_id = str(current_user.id)
+            ds_query = ds_query.eq("user_id", user_id)
+            env_query = env_query.eq("user_id", user_id)
+
+        datasets = ds_query.execute().data or []
+        environments = env_query.execute().data or []
+        if not datasets:
+            return resolved_ids
+
+        env_name_to_ids = {}
+        for env in environments:
+            env_name_norm = _normalize_lookup_text(env.get("name", ""))
+            if env_name_norm:
+                env_name_to_ids.setdefault(env_name_norm, []).append(env.get("id"))
+
+        datasets_by_env = {}
+        for ds in datasets:
+            datasets_by_env.setdefault(ds.get("environment_id"), []).append(ds)
+
+        path_mentions, plain_mentions = _extract_prompt_dataset_mentions(prompt)
+
+        matched_descriptions = []
+
+        # Resolve @Environment/Folder references first
+        for env_name, folder_name in path_mentions:
+            env_key = _fuzzy_match_key(_normalize_lookup_text(env_name), list(env_name_to_ids.keys()))
+            env_ids = env_name_to_ids.get(env_key, []) if env_key else []
+
+            candidate_datasets = []
+            for env_id in env_ids:
+                candidate_datasets.extend(datasets_by_env.get(env_id, []))
+            if not candidate_datasets:
+                candidate_datasets = datasets
+
+            matched = _match_dataset_by_name(folder_name, candidate_datasets)
+            if matched and matched.get("id") not in resolved_ids:
+                resolved_ids.append(matched["id"])
+                matched_descriptions.append(f"@{env_name}/{folder_name} -> {matched.get('name')}")
+
+        # Resolve @Folder references
+        for mention in plain_mentions:
+            matched = _match_dataset_by_name(mention, datasets)
+            if matched and matched.get("id") not in resolved_ids:
+                resolved_ids.append(matched["id"])
+                matched_descriptions.append(f"@{mention} -> {matched.get('name')}")
+
+        if matched_descriptions:
+            print("Resolved prompt references: " + "; ".join(matched_descriptions))
+
+        return resolved_ids
+
+    except Exception as e:
+        print(f"Warning: Could not resolve prompt references: {e}")
+        return resolved_ids
 
 
 def _build_relevance_query(
@@ -487,37 +695,57 @@ async def generate_image(
         raise HTTPException(status_code=500, detail="Google API key not configured")
     
     try:
-        # 1. Resolve the effective dataset_id from folder_id or dataset_id
-        #    folder_id maps to datasets.id — when provided, it takes priority
-        effective_dataset_id = request.folder_id or request.dataset_id
+        # 1. Resolve all referenced datasets:
+        #    - explicit folder_id / dataset_id
+        #    - @mentions in prompt (supports multiple references)
+        explicit_dataset_ids = []
+        if request.folder_id:
+            explicit_dataset_ids.append(request.folder_id)
+        if request.dataset_id and request.dataset_id not in explicit_dataset_ids:
+            explicit_dataset_ids.append(request.dataset_id)
+        resolved_dataset_ids = _resolve_referenced_dataset_ids(
+            supabase=supabase,
+            prompt=request.prompt,
+            current_user=current_user,
+            explicit_dataset_ids=explicit_dataset_ids,
+        )
+        primary_dataset_id = resolved_dataset_ids[0] if resolved_dataset_ids else None
         
         # Resolve style early so retrieval can include it
         effective_image_style = request.image_style or "photorealistic"
         additional_style_notes = request.style
 
-        # 2a. Fetch dataset images and select the most relevant references (top 14)
+        # 2a. Fetch images from all resolved datasets and select top 14 references
         # Uses Gemini embeddings over analyzed image metadata to improve consistency.
         reference_images = []
         folder_name = ""
         dataset_master_prompt = ""
         
-        if effective_dataset_id:
+        if resolved_dataset_ids:
             try:
-                # Fetch dataset name for logging
-                dataset_res = (
-                    supabase
-                    .table("datasets")
-                    .select("name, master_prompt")
-                    .eq("id", effective_dataset_id)
-                    .single()
-                    .execute()
-                )
-                if dataset_res.data:
-                    folder_name = dataset_res.data.get('name', '')
-                    dataset_master_prompt = dataset_res.data.get('master_prompt', '') or ''
-                    
-                    # Fetch dataset images in pages to cover the full folder
-                    all_images_data = []
+                all_images_data = []
+                dataset_names = []
+                master_prompts = []
+
+                for ds_id in resolved_dataset_ids:
+                    dataset_res = (
+                        supabase
+                        .table("datasets")
+                        .select("name, master_prompt")
+                        .eq("id", ds_id)
+                        .single()
+                        .execute()
+                    )
+                    if not dataset_res.data:
+                        continue
+
+                    ds_name = dataset_res.data.get("name", "") or ""
+                    ds_master_prompt = dataset_res.data.get("master_prompt", "") or ""
+                    if ds_name:
+                        dataset_names.append(ds_name)
+                    if ds_master_prompt:
+                        master_prompts.append(ds_master_prompt)
+
                     page_size = 1000
                     start = 0
                     while start < MAX_DATASET_IMAGES_FETCH:
@@ -526,60 +754,71 @@ async def generate_image(
                             supabase
                             .table("dataset_images")
                             .select("image_url, analysis_result, created_at")
-                            .eq("dataset_id", effective_dataset_id)
+                            .eq("dataset_id", ds_id)
                             .range(start, end)
                             .execute()
                         )
                         page_data = page_res.data or []
                         if not page_data:
                             break
+                        for row in page_data:
+                            row["source_dataset_id"] = ds_id
+                            row["source_dataset_name"] = ds_name
                         all_images_data.extend(page_data)
                         if len(page_data) < page_size:
                             break
                         start += page_size
 
-                    if all_images_data:
-                        print(f"Dataset '{folder_name}' has {len(all_images_data)} images (selecting top {MAX_REFERENCE_IMAGES})")
+                if all_images_data:
+                    folder_name = ", ".join(dataset_names[:10])
+                    dataset_master_prompt = " | ".join(master_prompts[:6])
+                    print(
+                        f"Resolved {len(resolved_dataset_ids)} dataset references "
+                        f"with {len(all_images_data)} total images (selecting top {MAX_REFERENCE_IMAGES})"
+                    )
 
-                        retrieval_query = _build_relevance_query(
-                            prompt=request.prompt,
-                            image_style=effective_image_style,
-                            style_notes=additional_style_notes or "",
-                            folder_name=folder_name,
-                            dataset_master_prompt=dataset_master_prompt,
-                        )
+                    retrieval_query = _build_relevance_query(
+                        prompt=request.prompt,
+                        image_style=effective_image_style,
+                        style_notes=additional_style_notes or "",
+                        folder_name=folder_name,
+                        dataset_master_prompt=dataset_master_prompt,
+                    )
 
-                        semantic_pool_size = min(
-                            len(all_images_data),
-                            max(MAX_REFERENCE_IMAGES, MAX_REFERENCE_IMAGES * HYBRID_CANDIDATE_MULTIPLIER)
-                        )
-                        semantic_candidates = _find_relevant_images_semantic(
-                            gemini_client=client,
-                            prompt=retrieval_query,
-                            images_data=all_images_data,
-                            max_images=semantic_pool_size,
-                        )
-                        ranked_images = _rerank_images_with_vision(
-                            gemini_client=client,
-                            prompt=retrieval_query,
-                            images_data=semantic_candidates,
-                            max_images=MAX_REFERENCE_IMAGES,
-                        )
+                    semantic_pool_size = min(
+                        len(all_images_data),
+                        max(MAX_REFERENCE_IMAGES, MAX_REFERENCE_IMAGES * HYBRID_CANDIDATE_MULTIPLIER)
+                    )
+                    semantic_candidates = _find_relevant_images_semantic(
+                        gemini_client=client,
+                        prompt=retrieval_query,
+                        images_data=all_images_data,
+                        max_images=semantic_pool_size,
+                    )
+                    ranked_images = _rerank_images_with_vision(
+                        gemini_client=client,
+                        prompt=retrieval_query,
+                        images_data=semantic_candidates,
+                        max_images=MAX_REFERENCE_IMAGES,
+                    )
 
-                        # Download the ranked references
-                        for img in ranked_images:
-                            if img.get('image_url'):
-                                try:
-                                    img_response = requests.get(img['image_url'], timeout=10)
-                                    if img_response.status_code == 200:
-                                        pil_image = PILImage.open(io.BytesIO(img_response.content))
-                                        pil_image = _resize_image_if_needed(pil_image)
-                                        reference_images.append(pil_image)
-                                        print(f"Selected reference image ({pil_image.size[0]}x{pil_image.size[1]}): {img['image_url']}")
-                                except Exception as img_error:
-                                    print(f"Warning: Could not load reference image {img.get('image_url')}: {img_error}")
-                        
-                        print(f"Loaded {len(reference_images)} reference images for generation")
+                    # Download the ranked references
+                    for img in ranked_images:
+                        if img.get('image_url'):
+                            try:
+                                img_response = requests.get(img['image_url'], timeout=10)
+                                if img_response.status_code == 200:
+                                    pil_image = PILImage.open(io.BytesIO(img_response.content))
+                                    pil_image = _resize_image_if_needed(pil_image)
+                                    reference_images.append(pil_image)
+                                    print(
+                                        f"Selected reference image from '{img.get('source_dataset_name', 'dataset')}' "
+                                        f"({pil_image.size[0]}x{pil_image.size[1]}): {img['image_url']}"
+                                    )
+                            except Exception as img_error:
+                                print(f"Warning: Could not load reference image {img.get('image_url')}: {img_error}")
+                    
+                    print(f"Loaded {len(reference_images)} reference images for generation")
                             
             except Exception as e:
                 print(f"Warning: Could not fetch dataset images: {e}")
@@ -754,7 +993,7 @@ async def generate_image(
                 "prompt": request.prompt,
                 "full_prompt": full_prompt,
                 "image_url": public_url,
-                "dataset_id": effective_dataset_id,
+                "dataset_id": primary_dataset_id,
                 "environment_id": request.environment_id,
                 "style": request.style,
                 "image_style": effective_image_style,
@@ -791,7 +1030,7 @@ async def generate_image(
             "image_url": public_url,
             "caption": request.prompt,
             "prompt_used": full_prompt,
-            "dataset_id": effective_dataset_id,
+            "dataset_id": primary_dataset_id,
             "environment_id": request.environment_id,
             "folder_id": request.folder_id,
             "style": request.style,
