@@ -19,7 +19,7 @@ from supabase import Client
 import os
 
 # ─── Constants ────────────────────────────────────────────────────
-MAX_REFERENCE_IMAGES = 5          # Cap reference images to reduce payload
+MAX_REFERENCE_IMAGES = 14         # Gemini 3 Pro supports up to 14 reference images
 MAX_IMAGE_DIMENSION = 1024        # Resize large images to this max width/height
 GEMINI_MAX_RETRIES = 3            # Retry transient 500 errors up to 3 times
 GEMINI_RETRY_BASE_DELAY = 2      # Base delay in seconds (exponential backoff)
@@ -304,105 +304,31 @@ async def generate_image(
         raise HTTPException(status_code=500, detail="Google API key not configured")
     
     try:
-        # 1. Fetch Business Profile context if needed (only if user is logged in)
-        business_context = ""
-        if current_user:
-            try:
-                profile_res = supabase.table("business_profiles").select("*").eq("id", current_user.id).single().execute()
-                if profile_res.data:
-                    p = profile_res.data
-                    business_context = f"Brand: {p.get('business_name')}. Vibe: {p.get('vibes')}. Theme: {p.get('theme')}. "
-            except Exception:
-                # Ignore if profile not found or other error for optional user
-                pass
-
-        # 2. Resolve the effective dataset_id from folder_id or dataset_id
-        # folder_id maps to datasets.id - when provided, it takes priority
+        # 1. Resolve the effective dataset_id from folder_id or dataset_id
+        #    folder_id maps to datasets.id — when provided, it takes priority
         effective_dataset_id = request.folder_id or request.dataset_id
         
-        # 2a. Fetch Dataset/Folder context if provided (including actual images as visual reference)
-        dataset_context = ""
-        dataset_master_prompt = ""
+        # 2a. Fetch Dataset/Folder reference images (up to 14, sent directly to Gemini)
+        # Following Gemini docs: simple prompt + reference images — no text-based search.
+        # https://ai.google.dev/gemini-api/docs/image-generation
         reference_images = []
-        unique_visual_elements = []
         folder_name = ""
-        dataset_env_name = ""  # e.g. "Product", "Environment", "Character"
-        dataset_image_style = ""
-        dataset_theme = ""
         
         if effective_dataset_id:
             try:
-                # Fetch dataset and its analyzed images for style reference
-                dataset_res = supabase.table("datasets").select("*").eq("id", effective_dataset_id).single().execute()
+                # Fetch dataset name for logging
+                dataset_res = supabase.table("datasets").select("name").eq("id", effective_dataset_id).single().execute()
                 if dataset_res.data:
                     folder_name = dataset_res.data.get('name', '')
-                    # Fetch environment name for @type/name reference context (e.g. @Product/dog)
-                    env_id = dataset_res.data.get('environment_id')
-                    if env_id:
-                        try:
-                            env_res = supabase.table("environments").select("name").eq("id", env_id).single().execute()
-                            if env_res.data:
-                                dataset_env_name = env_res.data.get('name', '') or ''
-                        except Exception:
-                            pass
-                    dataset_master_prompt = dataset_res.data.get('master_prompt', '')
-                    if dataset_master_prompt:
-                        dataset_context = f"Style Guidelines: {dataset_master_prompt}. "
                     
-                    # ── STEP A: Fetch ALL images with analysis (lightweight — no downloads yet)
-                    all_images_res = supabase.table("dataset_images").select("image_url, analysis_result").eq("dataset_id", effective_dataset_id).execute()
+                    # Fetch ALL image URLs from dataset (up to 14 — Gemini 3 Pro limit)
+                    all_images_res = supabase.table("dataset_images").select("image_url").eq("dataset_id", effective_dataset_id).limit(MAX_REFERENCE_IMAGES).execute()
                     
                     if all_images_res.data:
-                        all_dataset_images = all_images_res.data
-                        print(f"Dataset has {len(all_dataset_images)} total images")
+                        print(f"Dataset '{folder_name}' has {len(all_images_res.data)} images (sending up to {MAX_REFERENCE_IMAGES})")
                         
-                        # ── STEP B: Semantic relevance search via Gemini Embedding API
-                        # Embeds the user's prompt + every image's analysis text in one
-                        # batch API call, then ranks images by cosine similarity.
-                        # This finds images that are conceptually related to the prompt,
-                        # even when exact keywords don't match (e.g. "model holding
-                        # perfume" matches images tagged "fashion", "product", "luxury").
-                        selected_images = _find_relevant_images_semantic(
-                            gemini_client=client,
-                            prompt=request.prompt,
-                            images_data=all_dataset_images,
-                            max_images=MAX_REFERENCE_IMAGES,
-                        )
-                        
-                        # ── STEP C: Extract metadata from ALL images (for brand context),
-                        #            but only DOWNLOAD the selected relevant ones
-                        all_tags = []
-                        vibes = []
-                        lighting_styles = []
-                        colors = []
-                        all_descriptions = []
-                        image_styles = []
-                        themes = []
-                        key_elements = []
-                        
-                        # Gather brand-level context from ALL analyzed images in the dataset
-                        for img in all_dataset_images:
-                            if img.get('analysis_result'):
-                                analysis = img['analysis_result']
-                                if 'tags' in analysis and isinstance(analysis['tags'], list):
-                                    all_tags.extend(analysis['tags'])
-                                if 'description' in analysis:
-                                    all_descriptions.append(analysis['description'])
-                                if 'vibe' in analysis:
-                                    vibes.append(analysis['vibe'])
-                                if 'lighting' in analysis:
-                                    lighting_styles.append(analysis['lighting'])
-                                if 'colors' in analysis:
-                                    colors.append(analysis['colors'])
-                                if 'image_style' in analysis:
-                                    image_styles.append(analysis['image_style'])
-                                if 'theme' in analysis:
-                                    themes.append(analysis['theme'])
-                                if 'key_elements' in analysis and isinstance(analysis['key_elements'], list):
-                                    key_elements.extend(analysis['key_elements'])
-                        
-                        # ── STEP D: Download ONLY the top relevant images (saves bandwidth + time)
-                        for img in selected_images:
+                        # Download images directly — no semantic search, just send them all
+                        for img in all_images_res.data:
                             if img.get('image_url'):
                                 try:
                                     img_response = requests.get(img['image_url'], timeout=10)
@@ -414,212 +340,40 @@ async def generate_image(
                                 except Exception as img_error:
                                     print(f"Warning: Could not load reference image {img.get('image_url')}: {img_error}")
                         
-                        # Build unique visual elements list (remove duplicates, keep most common)
-                        if all_tags:
-                            from collections import Counter
-                            tag_counts = Counter(all_tags)
-                            unique_visual_elements = [tag for tag, count in tag_counts.most_common(10)]
-                            print(f"Extracted unique visual elements: {unique_visual_elements}")
-                        
-                        # Build unique key_elements list (remove duplicates)
-                        if key_elements:
-                            from collections import Counter as KeyCounter
-                            ke_counts = KeyCounter(key_elements)
-                            unique_key_elements = [el for el, _ in ke_counts.most_common(8)]
-                        else:
-                            unique_key_elements = []
-                        
-                        # Determine dominant image_style from dataset
-                        dataset_image_style = ""
-                        if image_styles:
-                            from collections import Counter as StyleCounter
-                            style_counts = StyleCounter(image_styles)
-                            dataset_image_style = style_counts.most_common(1)[0][0]
-                        
-                        # Determine dominant theme from dataset
-                        dataset_theme = ""
-                        if themes:
-                            from collections import Counter as ThemeCounter
-                            theme_counts = ThemeCounter(themes)
-                            dataset_theme = theme_counts.most_common(1)[0][0]
-                        
-                        # Build dataset_context as a CONCISE tag-based summary
-                        # The actual reference images are passed as binary — no need to repeat
-                        # verbose descriptions in the text prompt. Tags + keywords are enough.
-                        
-                        dataset_context = f"Brand: {folder_name}\n" if folder_name else ""
-                        
-                        if dataset_theme:
-                            dataset_context += f"Theme: {dataset_theme}\n"
-                        if dataset_image_style:
-                            dataset_context += f"Original Visual Style: {dataset_image_style}\n"
-                        
-                        # Tags and key elements are the critical shorthand for the visual DNA
-                        if unique_visual_elements:
-                            dataset_context += f"Signature Elements: {', '.join(unique_visual_elements)}\n"
-                        if unique_key_elements:
-                            dataset_context += f"Key Design Features: {', '.join(unique_key_elements)}\n"
-                        if colors:
-                            unique_colors = list(set(colors))
-                            dataset_context += f"Color Palette: {', '.join(unique_colors)}\n"
-                        if vibes:
-                            unique_vibes = list(set(vibes))
-                            dataset_context += f"Mood: {', '.join(unique_vibes)}\n"
-                        if lighting_styles:
-                            unique_lighting = list(set(lighting_styles))
-                            dataset_context += f"Lighting: {', '.join(unique_lighting)}\n"
+                        print(f"Loaded {len(reference_images)} reference images for generation")
                             
             except Exception as e:
-                print(f"Warning: Could not fetch dataset context: {e}")
-                # Continue anyway - dataset context is optional
+                print(f"Warning: Could not fetch dataset images: {e}")
+                # Continue anyway - reference images are optional
         
-        # 2b. If environment_id is provided WITHOUT a specific folder, gather broad brand context
-        #     from ALL trained folders in that environment
-        environment_context = ""
-        if request.environment_id and not effective_dataset_id:
-            try:
-                env_folders_res = supabase.table("datasets").select("name, master_prompt, training_status").eq("environment_id", request.environment_id).eq("training_status", "trained").execute()
-                if env_folders_res.data:
-                    # Look up environment name
-                    env_res = supabase.table("environments").select("name").eq("id", request.environment_id).single().execute()
-                    env_name = env_res.data.get('name', 'Environment') if env_res.data else 'Environment'
-                    
-                    environment_context = f"--- Brand Context: {env_name} ---\n"
-                    for folder in env_folders_res.data:
-                        if folder.get('master_prompt'):
-                            environment_context += f"[{folder['name']}]: {folder['master_prompt']}\n"
-                    
-                    print(f"Added environment-wide brand context from {len(env_folders_res.data)} trained folders")
-            except Exception as e:
-                print(f"Warning: Could not fetch environment context: {e}")
-                # Continue anyway - environment context is optional
-
-        # 3. Build the full prompt with system instruction format
+        # 3. Build the prompt — keep it simple, let the images do the work
+        # Following Gemini docs pattern: short prompt + reference images
+        # https://ai.google.dev/gemini-api/docs/image-generation
         
-        # Map image_style values to rich descriptive generation instructions
-        IMAGE_STYLE_DESCRIPTIONS = {
-            "photorealistic": "photorealistic, true-to-life, high-resolution photograph with natural detail",
-            "cinematic": "cinematic film-quality image with dramatic lighting, shallow depth of field, anamorphic lens flare, and movie-like color grading",
-            "illustration": "hand-drawn illustration style with clean lines and artistic detail",
-            "graphic_design": "clean graphic design with bold shapes, typography-friendly composition, and flat or semi-flat aesthetics",
-            "3d_render": "high-quality 3D rendered image with realistic materials, lighting, and depth",
-            "watercolor": "soft watercolor painting style with fluid brush strokes and translucent color washes",
-            "oil_painting": "rich oil painting style with visible brush texture, deep colors, and classical composition",
-            "sketch": "detailed pencil or pen sketch with hand-drawn linework and shading",
-            "pixel_art": "retro pixel art style with clean pixels and limited color palette",
-            "anime": "Japanese anime/manga art style with characteristic stylized features and vivid colors",
-            "vintage_film": "vintage analog film photograph with grain, muted colors, and nostalgic warmth",
-            "documentary": "documentary-style candid photograph with authentic natural lighting and real-world feel",
-            "editorial": "high-end editorial photography with polished styling, dramatic poses, and magazine-quality finish",
-            "studio_product": "professional studio product photography with clean background, controlled lighting, and sharp detail",
-            "aerial": "aerial or drone-perspective photography with sweeping top-down or elevated viewpoint",
-            "macro": "extreme close-up macro photography revealing fine textures and microscopic details",
-            "minimalist": "minimalist composition with clean negative space, simple forms, and restrained color palette",
-            "surreal": "surrealist art style with dreamlike impossible scenes and imaginative distortions",
-            "pop_art": "bold pop art style with bright colors, graphic patterns, and high contrast",
-        }
-        KNOWN_STYLES = set(IMAGE_STYLE_DESCRIPTIONS.keys())
+        # Resolve style (used for prompt without references)
+        effective_image_style = request.image_style or "photorealistic"
+        additional_style_notes = request.style
         
-        # Determine the image_style to use:
-        #   Priority: 1) request.image_style (explicit), 2) detect from request.style (fallback),
-        #             3) dataset dominant style, 4) default "photorealistic"
-        effective_image_style = request.image_style
-        additional_style_notes = request.style  # free-form style text for extra notes
-        
-        # Fallback: if image_style not set, check if request.style contains a known style name
-        # This handles frontends that send "cinematic" via the style field instead of image_style
-        if not effective_image_style and request.style:
-            style_lower = request.style.strip().lower().replace(" ", "_").replace("-", "_")
-            if style_lower in KNOWN_STYLES:
-                effective_image_style = style_lower
-                additional_style_notes = None  # consumed into image_style, don't duplicate
-        
-        # Fallback: use dataset's dominant analyzed style
-        if not effective_image_style and dataset_image_style:
-            effective_image_style = dataset_image_style
-        
-        # Final fallback
-        if not effective_image_style:
-            effective_image_style = "photorealistic"
-        
-        style_description = IMAGE_STYLE_DESCRIPTIONS.get(effective_image_style, f"{effective_image_style} style")
-        print(f"Resolved image_style: {effective_image_style} (from request.image_style={request.image_style}, request.style={request.style}, dataset={dataset_image_style})")
-        
-        # Create a structured prompt with clear separation (matches frontend structure)
-        if reference_images or unique_visual_elements:
+        if reference_images:
             # === PROMPT WITH REFERENCE IMAGES ===
-            # Uses Professional Commercial Photographer role with VISUAL FIDELITY RULES
-            # for Character/Product/Brand-Environment consistency.
-            
-            system_instruction = f"""ROLE: Professional Commercial Photographer.
-CORE INSTRUCTION: Generate a high-fidelity image based on the prompt: "{request.prompt}"."""
+            # Simple and direct — Gemini uses the images natively.
+            full_prompt = request.prompt
             
             if additional_style_notes:
-                system_instruction += f"\nCreative direction: {additional_style_notes}"
+                full_prompt += f" Style: {additional_style_notes}."
             
-            system_instruction += f"""
-
-VISUAL FIDELITY RULES:
-1. CHARACTER CONSISTENCY: If a "Character" reference is provided (e.g. @Character/person), the person in the output MUST be the same person shown in the references. Match facial features, hair, and build exactly.
-2. PRODUCT CONSISTENCY: If a "Product" reference is provided (e.g. @Product/dog), the product shown MUST be the exact item from the references. Match shape, branding, and materials.
-3. BRAND - ENVIRONMENT CONSISTENCY: If a "Brand - Environment" or "Environment" reference is provided (e.g. @Environment/coffee shop), the scene background and lighting MUST match the references exactly.
-
-REFERENCE NAMING (@type/name):
-The prompt may use @mentions to specify what to show. Interpret them as:
-- @Product/name = the product/item from the "name" folder — show it exactly as in the reference.
-- @Environment/name or @Brand-Environment/name = the scene/background from "name" — match the setting, lighting, and atmosphere.
-- @Character/name = the person from "name" — match the same face, hair, and build.
-Example: "make @Product/dog be inside @Environment/coffee shop with @Character/fat person" = place the dog product in a coffee shop scene, featuring the person from the character reference."""
-            
-            # Add current reference context when we have folder + environment names
-            if folder_name and dataset_env_name:
-                system_instruction += f"""
-
-CURRENT REFERENCE: The attached images are from @{dataset_env_name}/{folder_name}. Apply the appropriate rule above — the "{folder_name}" from this {dataset_env_name} reference MUST appear/match in the generated image."""
-            
-            system_instruction += f"""
-
-REFERENCE IMAGES ({len(reference_images)} attached below):
-These images define the VISUAL DNA of the brand. Study them carefully and extract:
-- Textures & materials (e.g. marble, wood, rattan, fabric)
-- Color palette and tones
-- Recurring objects, furniture, fixtures
-- Spatial layout and composition patterns
-- Distinctive design details
-You MUST incorporate these visual elements into the generated scene."""
-            
-            if dataset_context.strip():
-                system_instruction += f"""
-
-REFERENCE METADATA:
-{dataset_context.strip()}"""
-            
-            system_instruction += f"""
-
-IMAGE STYLE: {effective_image_style} — {style_description}. The output MUST be rendered in this style.
-QUALITY: Ultra high-definition commercial photography, 8k resolution, cinematic lighting."""
-            
-            full_prompt = system_instruction.strip()
+            print(f"Using simple prompt with {len(reference_images)} reference images")
         else:
-            # === PROMPT WITHOUT DATASET (simple generation) ===
+            # === PROMPT WITHOUT REFERENCE IMAGES (text-to-image) ===
             style_suffix = ""
             if additional_style_notes:
-                style_suffix = f" Creative direction: {additional_style_notes}."
+                style_suffix = f" {additional_style_notes} style."
             
-            image_style_prefix = f"Generate a {style_description} image."
-            
-            # Include environment_context when available (broad brand context without specific folder)
-            all_context = f"{business_context}{environment_context}{dataset_context}".strip()
-            if all_context:
-                full_prompt = f"{image_style_prefix}\n{all_context}\n\n{request.prompt}{style_suffix}".strip()
-            else:
-                full_prompt = f"{image_style_prefix}\n{request.prompt}{style_suffix}".strip()
+            full_prompt = f"{request.prompt}{style_suffix}".strip()
         
         print(f"Generating image with Nano Banana Pro (Gemini 3). Prompt: {full_prompt}")
         if reference_images:
             print(f"Using {len(reference_images)} reference images from dataset")
-        if unique_visual_elements:
-            print(f"Incorporating {len(unique_visual_elements)} unique visual elements")
         
         # 4. Generate image using Nano Banana Pro (Gemini 3 Pro Image Preview)
         if not client:
@@ -641,36 +395,23 @@ QUALITY: Ultra high-definition commercial photography, 8k resolution, cinematic 
         aspect_ratio = aspect_ratio_map.get(request.aspect_ratio, "1:1")
         resolution = "2K"
         
-        # Build parts and generate. If 400 INVALID_ARGUMENT (payload too large / invalid),
-        # retry once with fewer reference images (3 instead of 5).
+        # Build parts: [prompt, image1, image2, ...] — following Gemini docs pattern
+        # https://ai.google.dev/gemini-api/docs/image-generation#use-up-to-14-reference-images
         images_to_send = reference_images
         response = None
         
         for attempt in range(2):
-            # Build parts list: text instruction FIRST, then reference images, then a final nudge
+            # Prompt text first, then reference images (no trailing text)
             parts = [types.Part.from_text(text=full_prompt)]
             
-            uploaded_files = []  # Track uploaded files to use their URIs
+            uploaded_files = []  # Track uploaded files for cleanup
             
             if images_to_send:
-                # Use File API for robust handling of multiple images (avoids 20MB payload limit)
-                # We upload the images to Gemini first, then reference them by URI.
+                # Use File API to handle multiple images (avoids 20MB payload limit)
                 try:
                     for ref_img in images_to_send:
-                        # Ensure RGB mode
                         ref_img = _ensure_rgb_image(ref_img)
                         
-                        # Save to temp buffer
-                        img_byte_arr = io.BytesIO()
-                        ref_img.save(img_byte_arr, format='PNG')
-                        img_byte_arr.seek(0)
-                        
-                        # Upload to Gemini File API
-                        # We use a temporary named file to upload from memory
-                        # (The SDK client.files.upload expects a file path or file-like object)
-                        
-                        # Since SDK might strictly require a path or file-like with name, 
-                        # we'll save to a temp file on disk to be safe and robust.
                         with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as tf:
                             ref_img.save(tf.name, format="PNG")
                             tf_path = tf.name
@@ -679,43 +420,25 @@ QUALITY: Ultra high-definition commercial photography, 8k resolution, cinematic 
                             print(f"Uploading reference image to Gemini File API...")
                             uploaded_file = client.files.upload(path=tf_path, config=types.UploadFileConfig(mime_type="image/png"))
                             uploaded_files.append(uploaded_file)
-                            
-                            # Add the file reference to the prompt parts
                             parts.append(types.Part.from_uri(
                                 file_uri=uploaded_file.uri,
                                 mime_type=uploaded_file.mime_type
                             ))
                         finally:
-                            # Clean up local temp file
                             if os.path.exists(tf_path):
                                 os.unlink(tf_path)
                     
-                    # Add instruction text AFTER images as recommended in docs
-                    parts.append(types.Part.from_text(
-                        text=f"--- REFERENCE IMAGES ABOVE ({len(images_to_send)}) ---\n"
-                             f"Now generate the scene described above. Use the visual DNA from these {len(images_to_send)} reference images "
-                             f"(textures, materials, colors, objects, layout) but render the output in {effective_image_style} style."
-                    ))
-                    
                 except Exception as upload_err:
                     print(f"File API upload failed: {upload_err}. Falling back to inline bytes.")
-                    # Fallback logic if File API fails (e.g. network issue)
-                    # Clear parts and uploaded_files, restart with inline bytes
                     parts = [types.Part.from_text(text=full_prompt)]
-                    uploaded_files = [] # Clear any partial uploads
+                    uploaded_files = []
                     
-                    parts.append(types.Part.from_text(text=f"--- REFERENCE IMAGES ({len(images_to_send)}) — study these for visual DNA ---"))
                     for ref_img in images_to_send:
                         ref_img = _ensure_rgb_image(ref_img)
                         img_byte_arr = io.BytesIO()
                         ref_img.save(img_byte_arr, format='PNG')
                         img_byte_arr.seek(0)
-                        img_bytes = img_byte_arr.read()
-                        parts.append(types.Part.from_bytes(data=img_bytes, mime_type="image/png"))
-                    
-                    parts.append(types.Part.from_text(
-                         text=f"Now generate the scene described above. Use the visual DNA from these {len(images_to_send)} reference images (textures, materials, colors, objects, layout) but render the output in {effective_image_style} style."
-                    ))
+                        parts.append(types.Part.from_bytes(data=img_byte_arr.read(), mime_type="image/png"))
             
             contents = [types.Content(role="user", parts=parts)]
             
@@ -797,7 +520,7 @@ QUALITY: Ultra high-definition commercial photography, 8k resolution, cinematic 
                 "format": request.format,
                 "resolution": resolution,
                 "reference_images_count": len(images_to_send),
-                "unique_visual_elements": unique_visual_elements if unique_visual_elements else None
+                "unique_visual_elements": None
             }
             
             # Insert generation record into database
