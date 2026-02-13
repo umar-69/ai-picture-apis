@@ -356,13 +356,18 @@ async def generate_image(
         
         if reference_images:
             # === PROMPT WITH REFERENCE IMAGES ===
-            # Simple and direct — Gemini uses the images natively.
-            full_prompt = request.prompt
-            
+            # Follow Gemini "Prompts for editing images" pattern:
+            # https://ai.google.dev/gemini-api/docs/image-generation
+            # "Using the provided image(s)..." tells the model to match style, lighting, subjects.
+            # Keep it simple; the user's prompt describes the scene.
+            full_prompt = (
+                f"Using the provided reference images, create the following. "
+                f"Match the subjects, style, lighting, and key visual elements from these images: {request.prompt}"
+            )
             if additional_style_notes:
-                full_prompt += f" Style: {additional_style_notes}."
+                full_prompt += f" {additional_style_notes}."
             
-            print(f"Using simple prompt with {len(reference_images)} reference images")
+            print(f"Using reference-image prompt with {len(reference_images)} images")
         else:
             # === PROMPT WITHOUT REFERENCE IMAGES (text-to-image) ===
             style_suffix = ""
