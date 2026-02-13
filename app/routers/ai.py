@@ -326,6 +326,7 @@ async def generate_image(
         reference_images = []
         unique_visual_elements = []
         folder_name = ""
+        dataset_env_name = ""  # e.g. "Product", "Environment", "Character"
         dataset_image_style = ""
         dataset_theme = ""
         
@@ -335,6 +336,15 @@ async def generate_image(
                 dataset_res = supabase.table("datasets").select("*").eq("id", effective_dataset_id).single().execute()
                 if dataset_res.data:
                     folder_name = dataset_res.data.get('name', '')
+                    # Fetch environment name for @type/name reference context (e.g. @Product/dog)
+                    env_id = dataset_res.data.get('environment_id')
+                    if env_id:
+                        try:
+                            env_res = supabase.table("environments").select("name").eq("id", env_id).single().execute()
+                            if env_res.data:
+                                dataset_env_name = env_res.data.get('name', '') or ''
+                        except Exception:
+                            pass
                     dataset_master_prompt = dataset_res.data.get('master_prompt', '')
                     if dataset_master_prompt:
                         dataset_context = f"Style Guidelines: {dataset_master_prompt}. "
@@ -535,44 +545,59 @@ async def generate_image(
         style_description = IMAGE_STYLE_DESCRIPTIONS.get(effective_image_style, f"{effective_image_style} style")
         print(f"Resolved image_style: {effective_image_style} (from request.image_style={request.image_style}, request.style={request.style}, dataset={dataset_image_style})")
         
-        # Create a structured prompt with clear separation between STYLE, REFERENCE, and SCENE
+        # Create a structured prompt with clear separation (matches frontend structure)
         if reference_images or unique_visual_elements:
             # === PROMPT WITH REFERENCE IMAGES ===
-            # The binary reference images attached below are the PRIMARY visual source.
-            # The text prompt is a concise instruction set — NOT a verbose image description.
+            # Uses Professional Commercial Photographer role with VISUAL FIDELITY RULES
+            # for Character/Product/Brand-Environment consistency.
             
-            system_instruction = f"""You are generating a new image. Follow these instructions in strict priority order:
-
-1. IMAGE STYLE: {effective_image_style} — {style_description}.
-   The output MUST be rendered in this style. This overrides the style of the reference images.
-
-2. SCENE: {request.prompt}"""
+            system_instruction = f"""ROLE: Professional Commercial Photographer.
+CORE INSTRUCTION: Generate a high-fidelity image based on the prompt: "{request.prompt}"."""
             
             if additional_style_notes:
-                system_instruction += f"\n   Creative direction: {additional_style_notes}"
+                system_instruction += f"\nCreative direction: {additional_style_notes}"
             
             system_instruction += f"""
 
-3. REFERENCE IMAGES ({len(reference_images)} attached below):
-   These images define the VISUAL DNA of the brand. Study them carefully and extract:
-   - Textures & materials (e.g. marble, wood, rattan, fabric)
-   - Color palette and tones
-   - Recurring objects, furniture, fixtures
-   - Spatial layout and composition patterns
-   - Distinctive design details
-   You MUST incorporate these visual elements into the generated scene.
-   The reference images show the LOOK AND FEEL — apply it to the SCENE above in {effective_image_style} style."""
+VISUAL FIDELITY RULES:
+1. CHARACTER CONSISTENCY: If a "Character" reference is provided (e.g. @Character/person), the person in the output MUST be the same person shown in the references. Match facial features, hair, and build exactly.
+2. PRODUCT CONSISTENCY: If a "Product" reference is provided (e.g. @Product/dog), the product shown MUST be the exact item from the references. Match shape, branding, and materials.
+3. BRAND - ENVIRONMENT CONSISTENCY: If a "Brand - Environment" or "Environment" reference is provided (e.g. @Environment/coffee shop), the scene background and lighting MUST match the references exactly.
+
+REFERENCE NAMING (@type/name):
+The prompt may use @mentions to specify what to show. Interpret them as:
+- @Product/name = the product/item from the "name" folder — show it exactly as in the reference.
+- @Environment/name or @Brand-Environment/name = the scene/background from "name" — match the setting, lighting, and atmosphere.
+- @Character/name = the person from "name" — match the same face, hair, and build.
+Example: "make @Product/dog be inside @Environment/coffee shop with @Character/fat person" = place the dog product in a coffee shop scene, featuring the person from the character reference."""
+            
+            # Add current reference context when we have folder + environment names
+            if folder_name and dataset_env_name:
+                system_instruction += f"""
+
+CURRENT REFERENCE: The attached images are from @{dataset_env_name}/{folder_name}. Apply the appropriate rule above — the "{folder_name}" from this {dataset_env_name} reference MUST appear/match in the generated image."""
+            
+            system_instruction += f"""
+
+REFERENCE IMAGES ({len(reference_images)} attached below):
+These images define the VISUAL DNA of the brand. Study them carefully and extract:
+- Textures & materials (e.g. marble, wood, rattan, fabric)
+- Color palette and tones
+- Recurring objects, furniture, fixtures
+- Spatial layout and composition patterns
+- Distinctive design details
+You MUST incorporate these visual elements into the generated scene."""
             
             if dataset_context.strip():
                 system_instruction += f"""
 
-4. BRAND TAGS (concise summary of reference image DNA):
+REFERENCE METADATA:
 {dataset_context.strip()}"""
             
-            system_instruction += """
+            system_instruction += f"""
 
-IMPORTANT: The attached reference images are your primary visual source. The tags above are a text summary.
-Generate the SCENE using the visual DNA from the references, rendered in the specified IMAGE STYLE."""
+IMAGE STYLE: {effective_image_style} — {style_description}. The output MUST be rendered in this style.
+QUALITY: Ultra high-definition commercial photography, 8k resolution, cinematic lighting."""
             
             full_prompt = system_instruction.strip()
         else:
