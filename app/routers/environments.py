@@ -9,6 +9,57 @@ from app.schemas import (
 router = APIRouter(tags=["Environments"])
 
 
+def _normalize_entity_name(name: str) -> str:
+    """Normalize names so matching is consistent across API/UI input."""
+    return " ".join((name or "").strip().split())
+
+
+def _assert_unique_environment_name(
+    supabase: Client,
+    user_id: str,
+    name: str,
+    exclude_id: str | None = None,
+) -> None:
+    target = _normalize_entity_name(name).lower()
+    rows = (
+        supabase.table("environments")
+        .select("id, name")
+        .eq("user_id", user_id)
+        .execute()
+        .data
+        or []
+    )
+    for row in rows:
+        if exclude_id and row.get("id") == exclude_id:
+            continue
+        if _normalize_entity_name(row.get("name", "")).lower() == target:
+            raise HTTPException(status_code=409, detail="Environment name already exists")
+
+
+def _assert_unique_folder_name(
+    supabase: Client,
+    user_id: str,
+    environment_id: str,
+    name: str,
+    exclude_id: str | None = None,
+) -> None:
+    target = _normalize_entity_name(name).lower()
+    rows = (
+        supabase.table("datasets")
+        .select("id, name")
+        .eq("user_id", user_id)
+        .eq("environment_id", environment_id)
+        .execute()
+        .data
+        or []
+    )
+    for row in rows:
+        if exclude_id and row.get("id") == exclude_id:
+            continue
+        if _normalize_entity_name(row.get("name", "")).lower() == target:
+            raise HTTPException(status_code=409, detail="Folder name already exists in this environment")
+
+
 # ─── Environments CRUD ───────────────────────────────────────────
 
 @router.get("/environments", response_model=dict)
@@ -36,8 +87,14 @@ def create_environment(
 ):
     """Create a new environment."""
     try:
+        clean_name = _normalize_entity_name(body.name)
+        if not clean_name:
+            raise HTTPException(status_code=400, detail="Environment name is required")
+
+        _assert_unique_environment_name(supabase, str(current_user.id), clean_name)
+
         res = supabase.table("environments").insert({
-            "name": body.name,
+            "name": clean_name,
             "user_id": str(current_user.id)
         }).execute()
         if not res.data:
@@ -58,8 +115,19 @@ def update_environment(
 ):
     """Rename an environment. Must belong to the authenticated user."""
     try:
+        clean_name = _normalize_entity_name(body.name)
+        if not clean_name:
+            raise HTTPException(status_code=400, detail="Environment name is required")
+
+        _assert_unique_environment_name(
+            supabase,
+            str(current_user.id),
+            clean_name,
+            exclude_id=environment_id,
+        )
+
         res = supabase.table("environments") \
-            .update({"name": body.name}) \
+            .update({"name": clean_name}) \
             .eq("id", environment_id) \
             .eq("user_id", str(current_user.id)) \
             .execute()
@@ -146,6 +214,10 @@ def create_folder(
 ):
     """Create a new folder (dataset) inside an environment."""
     try:
+        clean_name = _normalize_entity_name(body.name)
+        if not clean_name:
+            raise HTTPException(status_code=400, detail="Folder name is required")
+
         # Verify the environment belongs to this user
         env_check = supabase.table("environments") \
             .select("id") \
@@ -155,8 +227,15 @@ def create_folder(
         if not env_check.data:
             raise HTTPException(status_code=404, detail="Environment not found or not owned by you")
 
+        _assert_unique_folder_name(
+            supabase,
+            str(current_user.id),
+            environment_id,
+            clean_name,
+        )
+
         res = supabase.table("datasets").insert({
-            "name": body.name,
+            "name": clean_name,
             "environment_id": environment_id,
             "user_id": str(current_user.id)
         }).execute()
@@ -178,8 +257,29 @@ def update_folder(
 ):
     """Rename a folder. Must belong to the authenticated user."""
     try:
+        clean_name = _normalize_entity_name(body.name)
+        if not clean_name:
+            raise HTTPException(status_code=400, detail="Folder name is required")
+
+        folder_row = supabase.table("datasets") \
+            .select("id, environment_id") \
+            .eq("id", folder_id) \
+            .eq("user_id", str(current_user.id)) \
+            .execute()
+        if not folder_row.data:
+            raise HTTPException(status_code=404, detail="Folder not found or not owned by you")
+
+        env_id = folder_row.data[0].get("environment_id")
+        _assert_unique_folder_name(
+            supabase,
+            str(current_user.id),
+            env_id,
+            clean_name,
+            exclude_id=folder_id,
+        )
+
         res = supabase.table("datasets") \
-            .update({"name": body.name}) \
+            .update({"name": clean_name}) \
             .eq("id", folder_id) \
             .eq("user_id", str(current_user.id)) \
             .execute()

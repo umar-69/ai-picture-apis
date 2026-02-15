@@ -21,7 +21,10 @@ from supabase import Client
 import os
 
 # ─── Constants ────────────────────────────────────────────────────
-MAX_REFERENCE_IMAGES = 14         # Gemini 3 Pro supports up to 14 reference images
+MODEL_MAX_REFERENCE_IMAGES = 14   # Gemini 3 Pro hard cap for generation inputs
+REFERENCE_SELECTION_TARGET = 8    # Soft target to reduce style drift/confusion
+REFERENCE_MIN_IMAGES = 4          # Keep enough references for identity consistency
+VISION_RELEVANCE_THRESHOLD = 0.45 # Drop weakly-related vision candidates when possible
 MAX_IMAGE_DIMENSION = 1024        # Resize large images to this max width/height
 GEMINI_MAX_RETRIES = 3            # Retry transient 500 errors up to 3 times
 GEMINI_RETRY_BASE_DELAY = 2      # Base delay in seconds (exponential backoff)
@@ -224,17 +227,19 @@ def _resolve_referenced_dataset_ids(
     prompt: str,
     current_user=None,
     explicit_dataset_ids: list[str] | None = None,
+    preferred_environment_id: str | None = None,
 ) -> list[str]:
     """
     Resolve all dataset IDs referenced in prompt @mentions.
-    Combines explicit IDs (folder_id/dataset_id) + prompt references.
+    Combines explicit IDs (folder_id/dataset_id), optional environment scope,
+    and prompt references.
     """
     resolved_ids = []
     for ds_id in (explicit_dataset_ids or []):
         if ds_id and ds_id not in resolved_ids:
             resolved_ids.append(ds_id)
 
-    if not prompt:
+    if not prompt and not preferred_environment_id:
         return resolved_ids
 
     try:
@@ -264,6 +269,19 @@ def _resolve_referenced_dataset_ids(
 
         matched_descriptions = []
 
+        # If an environment is explicitly selected, prioritize all folders inside it.
+        if preferred_environment_id:
+            preferred_env_datasets = datasets_by_env.get(preferred_environment_id, [])
+            for ds in preferred_env_datasets:
+                ds_id = ds.get("id")
+                if ds_id and ds_id not in resolved_ids:
+                    resolved_ids.append(ds_id)
+            if preferred_env_datasets:
+                print(
+                    f"Environment scope resolved: {len(preferred_env_datasets)} folders "
+                    f"from environment_id={preferred_environment_id}"
+                )
+
         # Resolve @Environment/Folder references first
         for env_name, folder_name in path_mentions:
             env_key = _fuzzy_match_key(_normalize_lookup_text(env_name), list(env_name_to_ids.keys()))
@@ -280,9 +298,12 @@ def _resolve_referenced_dataset_ids(
                 resolved_ids.append(matched["id"])
                 matched_descriptions.append(f"@{env_name}/{folder_name} -> {matched.get('name')}")
 
-        # Resolve @Folder references
+        # Resolve @Folder references (prefer selected environment when available)
+        preferred_plain_pool = datasets_by_env.get(preferred_environment_id, []) if preferred_environment_id else []
         for mention in plain_mentions:
-            matched = _match_dataset_by_name(mention, datasets)
+            matched = _match_dataset_by_name(mention, preferred_plain_pool) if preferred_plain_pool else None
+            if not matched:
+                matched = _match_dataset_by_name(mention, datasets)
             if matched and matched.get("id") not in resolved_ids:
                 resolved_ids.append(matched["id"])
                 matched_descriptions.append(f"@{mention} -> {matched.get('name')}")
@@ -348,7 +369,7 @@ def _find_relevant_images_semantic(
     gemini_client,
     prompt: str,
     images_data: list,
-    max_images: int = MAX_REFERENCE_IMAGES,
+    max_images: int = MODEL_MAX_REFERENCE_IMAGES,
 ) -> list:
     """
     Use Gemini Embedding API to find the most semantically relevant
@@ -438,7 +459,9 @@ def _rerank_images_with_vision(
     gemini_client,
     prompt: str,
     images_data: list,
-    max_images: int = MAX_REFERENCE_IMAGES,
+    max_images: int = REFERENCE_SELECTION_TARGET,
+    min_images: int = REFERENCE_MIN_IMAGES,
+    relevance_threshold: float = VISION_RELEVANCE_THRESHOLD,
 ) -> list:
     """
     Vision rerank stage (direct image understanding).
@@ -561,9 +584,20 @@ def _rerank_images_with_vision(
             scored.append((0.0, img))
 
     scored.sort(key=lambda x: x[0], reverse=True)
-    selected = [img for _, img in scored[:max_images]]
 
-    print(f"Vision rerank selected {len(selected)} references from {len(images_data)} semantic candidates")
+    # Keep only strong matches when possible; fall back to top-ranked items if too strict.
+    threshold_selected = [img for score, img in scored if score >= relevance_threshold][:max_images]
+    if len(threshold_selected) >= min_images:
+        selected = threshold_selected
+        mode = f"threshold>={relevance_threshold}"
+    else:
+        selected = [img for _, img in scored[:max_images]]
+        mode = "top-ranked-fallback"
+
+    print(
+        f"Vision rerank selected {len(selected)} references from {len(images_data)} semantic candidates "
+        f"({mode})"
+    )
     return selected
 
 
@@ -687,7 +721,7 @@ async def generate_image(
     """
     Generate an image using Nano Banana Pro (Gemini 3 Pro Image Preview).
     Professional asset production with advanced reasoning and high-resolution output.
-    Supports: 1K/2K/4K resolution, up to 14 reference images, business profile context.
+    Supports: 1K/2K/4K resolution, adaptive reference selection, business profile context.
     Returns the generated image URL from Supabase storage.
     """
     
@@ -708,6 +742,7 @@ async def generate_image(
             prompt=request.prompt,
             current_user=current_user,
             explicit_dataset_ids=explicit_dataset_ids,
+            preferred_environment_id=request.environment_id,
         )
         primary_dataset_id = resolved_dataset_ids[0] if resolved_dataset_ids else None
         
@@ -715,11 +750,17 @@ async def generate_image(
         effective_image_style = request.image_style or "photorealistic"
         additional_style_notes = request.style
 
-        # 2a. Fetch images from all resolved datasets and select top 14 references
+        # 2a. Fetch images from all resolved datasets and select a focused subset
         # Uses Gemini embeddings over analyzed image metadata to improve consistency.
         reference_images = []
         folder_name = ""
         dataset_master_prompt = ""
+        # If many folders are referenced, increase target so each can contribute,
+        # while still honoring model hard limits.
+        reference_target = min(
+            MODEL_MAX_REFERENCE_IMAGES,
+            max(REFERENCE_SELECTION_TARGET, len(resolved_dataset_ids))
+        )
         
         if resolved_dataset_ids:
             try:
@@ -774,7 +815,8 @@ async def generate_image(
                     dataset_master_prompt = " | ".join(master_prompts[:6])
                     print(
                         f"Resolved {len(resolved_dataset_ids)} dataset references "
-                        f"with {len(all_images_data)} total images (selecting top {MAX_REFERENCE_IMAGES})"
+                        f"with {len(all_images_data)} total images "
+                        f"(targeting top {reference_target}, hard cap {MODEL_MAX_REFERENCE_IMAGES})"
                     )
 
                     retrieval_query = _build_relevance_query(
@@ -787,7 +829,7 @@ async def generate_image(
 
                     semantic_pool_size = min(
                         len(all_images_data),
-                        max(MAX_REFERENCE_IMAGES, MAX_REFERENCE_IMAGES * HYBRID_CANDIDATE_MULTIPLIER)
+                        max(reference_target, reference_target * HYBRID_CANDIDATE_MULTIPLIER)
                     )
                     semantic_candidates = _find_relevant_images_semantic(
                         gemini_client=client,
@@ -799,8 +841,51 @@ async def generate_image(
                         gemini_client=client,
                         prompt=retrieval_query,
                         images_data=semantic_candidates,
-                        max_images=MAX_REFERENCE_IMAGES,
+                        max_images=reference_target,
                     )
+
+                    # Coverage guard: ensure each referenced dataset can contribute
+                    # at least one image when possible.
+                    dataset_counts = {}
+                    for img in ranked_images:
+                        ds = img.get("source_dataset_id")
+                        if ds:
+                            dataset_counts[ds] = dataset_counts.get(ds, 0) + 1
+
+                    for ds_id in resolved_dataset_ids:
+                        if dataset_counts.get(ds_id, 0) > 0:
+                            continue
+                        replacement = next(
+                            (
+                                img for img in semantic_candidates
+                                if img.get("source_dataset_id") == ds_id and img not in ranked_images
+                            ),
+                            None,
+                        )
+                        if not replacement:
+                            continue
+
+                        if len(ranked_images) < reference_target:
+                            ranked_images.append(replacement)
+                            dataset_counts[ds_id] = dataset_counts.get(ds_id, 0) + 1
+                            continue
+
+                        # If target is full, replace an overrepresented dataset sample.
+                        replace_idx = None
+                        for idx in range(len(ranked_images) - 1, -1, -1):
+                            existing_ds = ranked_images[idx].get("source_dataset_id")
+                            if existing_ds and dataset_counts.get(existing_ds, 0) > 1:
+                                replace_idx = idx
+                                break
+
+                        if replace_idx is None:
+                            continue
+
+                        removed_ds = ranked_images[replace_idx].get("source_dataset_id")
+                        if removed_ds:
+                            dataset_counts[removed_ds] = max(0, dataset_counts.get(removed_ds, 0) - 1)
+                        ranked_images[replace_idx] = replacement
+                        dataset_counts[ds_id] = dataset_counts.get(ds_id, 0) + 1
 
                     # Download the ranked references
                     for img in ranked_images:
@@ -879,7 +964,7 @@ async def generate_image(
         
         # Build parts: [prompt, image1, image2, ...] — following Gemini docs pattern
         # https://ai.google.dev/gemini-api/docs/image-generation#use-up-to-14-reference-images
-        images_to_send = reference_images
+        images_to_send = reference_images[:MODEL_MAX_REFERENCE_IMAGES]
         response = None
         
         for attempt in range(2):
