@@ -131,6 +131,49 @@ def _trim_mention_phrase(raw: str) -> str:
     return " ".join(kept).strip()
 
 
+def _sanitize_prompt_for_generation(raw_prompt: str) -> str:
+    """
+    Remove prompt wrapper noise that harms reference consistency:
+      - appended "Chat History: ..."
+      - empty business-context boilerplate with N/A values
+      - transcript role labels accidentally included in prompt text
+    """
+    if not raw_prompt:
+        return ""
+
+    text = raw_prompt.strip()
+
+    # Keep only the current request text, drop appended transcript blocks.
+    text = re.split(r"\bchat\s*history\s*:\s*", text, maxsplit=1, flags=re.IGNORECASE)[0]
+
+    # Remove boilerplate context blocks when all values are effectively empty.
+    text = re.sub(
+        r"\bBusiness\s*Context\s*:\s*Business\s*:\s*(?:N/?A|None)\s*"
+        r"Theme\s*:\s*(?:N/?A|None)\s*Vibe\s*:\s*(?:N/?A|None)\s*"
+        r"Customer\s*:\s*(?:N/?A|None)\b\.?",
+        "",
+        text,
+        flags=re.IGNORECASE,
+    )
+    text = re.sub(
+        r"\bBusiness\s*:\s*(?:N/?A|None)\s*Theme\s*:\s*(?:N/?A|None)\s*"
+        r"Vibe\s*:\s*(?:N/?A|None)\s*Customer\s*:\s*(?:N/?A|None)\b\.?",
+        "",
+        text,
+        flags=re.IGNORECASE,
+    )
+
+    # Remove leaked transcript role prefixes.
+    text = re.sub(r"\b(?:user|assistant)\s*:\s*", "", text, flags=re.IGNORECASE)
+
+    # Clean up orphan '@' markers and whitespace artifacts.
+    text = re.sub(r"@\s*(?=$|[.,;:!?])", "", text)
+    text = re.sub(r"\s+", " ", text).strip()
+    text = re.sub(r"\s+([,.;:!?])", r"\1", text)
+
+    return text
+
+
 def _extract_prompt_dataset_mentions(prompt: str) -> tuple[list[tuple[str, str]], list[str]]:
     """
     Extract potential dataset mentions from prompt text.
@@ -729,6 +772,10 @@ async def generate_image(
         raise HTTPException(status_code=500, detail="Google API key not configured")
     
     try:
+        clean_prompt = _sanitize_prompt_for_generation(request.prompt)
+        if not clean_prompt:
+            clean_prompt = (request.prompt or "").strip()
+
         # 1. Resolve all referenced datasets:
         #    - explicit folder_id / dataset_id
         #    - @mentions in prompt (supports multiple references)
@@ -739,7 +786,7 @@ async def generate_image(
             explicit_dataset_ids.append(request.dataset_id)
         resolved_dataset_ids = _resolve_referenced_dataset_ids(
             supabase=supabase,
-            prompt=request.prompt,
+            prompt=clean_prompt,
             current_user=current_user,
             explicit_dataset_ids=explicit_dataset_ids,
             preferred_environment_id=request.environment_id,
@@ -820,7 +867,7 @@ async def generate_image(
                     )
 
                     retrieval_query = _build_relevance_query(
-                        prompt=request.prompt,
+                        prompt=clean_prompt,
                         image_style=effective_image_style,
                         style_notes=additional_style_notes or "",
                         folder_name=folder_name,
@@ -923,7 +970,7 @@ async def generate_image(
                 "Using the provided reference images as visual ground truth, generate one final image. "
                 "Preserve the most important subject identity, composition language, lighting behavior, "
                 "texture/material treatment, and overall color palette from those references. "
-                f"User request: {request.prompt}. "
+                f"User request: {clean_prompt}. "
                 f"Target style class: {effective_image_style}."
             )
             if additional_style_notes:
@@ -936,7 +983,7 @@ async def generate_image(
             if additional_style_notes:
                 style_suffix = f" {additional_style_notes} style."
             
-            full_prompt = f"{request.prompt}{style_suffix}".strip()
+            full_prompt = f"{clean_prompt}{style_suffix}".strip()
         
         print(f"Generating image with Nano Banana Pro (Gemini 3). Prompt: {full_prompt}")
         if reference_images:
@@ -1075,7 +1122,7 @@ async def generate_image(
         try:
             generation_record = {
                 "user_id": current_user.id if current_user else None,
-                "prompt": request.prompt,
+                "prompt": clean_prompt,
                 "full_prompt": full_prompt,
                 "image_url": public_url,
                 "dataset_id": primary_dataset_id,
@@ -1105,7 +1152,7 @@ async def generate_image(
                 supabase, str(current_user.id),
                 action_type="generate_image",
                 credits=CREDIT_COSTS["generate_image"],
-                prompt=request.prompt,
+                prompt=clean_prompt,
                 metadata={"generation_id": generation_id, "resolution": resolution}
             )
         
@@ -1113,7 +1160,7 @@ async def generate_image(
         return {
             "id": generation_id,
             "image_url": public_url,
-            "caption": request.prompt,
+            "caption": clean_prompt,
             "prompt_used": full_prompt,
             "dataset_id": primary_dataset_id,
             "environment_id": request.environment_id,
